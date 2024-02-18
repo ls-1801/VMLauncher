@@ -1,0 +1,24 @@
+ logLevel: LOG_INFO
+ localWorkerIp: {ip_addr}
+ coordinatorIp: {host_ip_addr}
+ numberOfSlots: 2147483647
+ queryCompiler:
+   queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+ workerId: {worker_id}
+ parentId: {parent_id}
+ dataPort: 8432
+ numWorkerThreads: 1
+ rpcPort: 8433
+ coordinatorPort: 8434
+ physicalSources:
+   - type: TCP_SOURCE
+     configuration:
+       socketHost: {host_ip_addr}
+       socketPort: 8091
+       socketDomain: AF_INET
+       socketType: SOCK_STREAM
+       flushIntervalMS: 2000
+       inputFormat: CSV
+       decideMessageSize: TUPLE_SEPARATOR
+     logicalSourceName: input{worker_id}
+     physicalSourceName: input{worker_id}_phys
