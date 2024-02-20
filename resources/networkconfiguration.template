@@ -1,0 +1,7 @@
+[Match]
+Name=eth0
+
+[Network]
+DNS=1.1.1.1
+Address={ip_addr}/24
+Gateway={host_ip_addr}

@@ -1,0 +1,11 @@
+[Unit]
+Description=NebulaStream Service
+[Service]
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker rm --force nes-worker
+ExecStart=/usr/bin/docker run --name worker-worker -v /config:/config --pull always --log-driver=journald --net host {host_ip_addr}:5000/nebulastream/nes-executable-image nesWorker --configPath=/config/workerConfig.yaml
+ExecStop=/usr/bin/docker stop nes-worker
+Restart=always
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
