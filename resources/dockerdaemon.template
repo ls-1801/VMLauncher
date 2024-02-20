@@ -1,3 +1,3 @@
-{
+\{
 "insecure-registries": ["{host_ip_addr}:5000"]
 }

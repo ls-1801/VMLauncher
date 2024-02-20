@@ -11,7 +11,7 @@ pub fn stderr_as_str(output: &Output) -> &str {
     std::str::from_utf8(output.stderr.as_ref()).unwrap()
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(data))]
 pub async fn run_shell_command_with_stdin(
     command: &str,
     args: Vec<&str>,
@@ -30,7 +30,7 @@ pub async fn run_shell_command_with_stdin(
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(&data)
+        .write_all(data)
         .await
         .unwrap();
 

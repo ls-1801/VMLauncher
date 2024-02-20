@@ -1,7 +1,14 @@
-use crate::shell::run_shell_command_with_stdin;
-use indoc::indoc;
-use serde::Serialize;
+use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+
+use serde::Serialize;
+use tempdir::TempDir;
+
+use crate::network::Tap;
+use crate::qemu::LaunchConfiguration;
+use crate::shell::run_shell_command_with_stdin;
+use crate::templates::{Templates, WorkerConfiguration};
 
 #[derive(Debug, Serialize)]
 struct Content {
@@ -50,30 +57,19 @@ async fn run_butane(config: &FlatcarConfig) -> String {
     .expect("could not run docker")
 }
 
-async fn prepare_launch() {}
+pub struct Args {
+    pub flatcar_fresh_image: PathBuf,
+}
 
-#[test]
-fn should_serialize_properly() {
-    let config = FlatcarConfig {
+fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
+    FlatcarConfig {
         version: "1.0.0".to_string(),
         variant: "flatcar".to_string(),
         systemd: FlatcarSystemdConfig {
             units: vec![FlatcarSystemdUnitConfig {
-                name: "nginx.service".to_string(),
+                name: "nesWorker.service".to_string(),
                 enabled: true,
-                contents: indoc! {"
-                    [Unit]
-                    Description=NGINX service
-                    [Service]
-                    TimeoutStartSec=0
-                    ExecStartPre=-/usr/bin/docker rm --force nginx1
-                    ExecStart=/usr/bin/docker run --name worker -v /config:/config --pull always --log-driver=journald --net host 192.168.1.100:5000/nebulastream/nes-executable-image nesWorker --configPath=/config/workerConfig.yaml
-                    ExecStop=/usr/bin/docker stop nginx1
-                    Restart=always
-                    RestartSec=5s
-                    [Install]
-                    WantedBy=multi-user.target
-                "}.to_string(),
+                contents: Templates::docker_unit(&wc),
             }],
         },
         storage: FlatcarStorageConfig {
@@ -81,50 +77,99 @@ fn should_serialize_properly() {
                 FlatcarStorageFileConfig {
                     path: PathBuf::from("/etc/systemd/network/00-eth0.network"),
                     contents: Content {
-                        inline: indoc! {r#"
-                          [Match]
-                          Name=eth0
-
-                          [Network]
-                          DNS=1.1.1.1
-                          Address=192.168.1.101/24
-                          Gateway=192.168.1.100
-                        "#}.to_string()
+                        inline: Templates::network_config(&wc),
                     },
                 },
                 FlatcarStorageFileConfig {
-                    path: PathBuf::from("/config/workerConfig.yaml"),
+                    path: PathBuf::from("/config/workerConfiguration.yaml"),
                     contents: Content {
-                        inline: indoc! {r##"
-                          workerId: 2
-                          localWorkerIp: 192.168.1.101
-                          coordinatorIp: 192.168.1.100
-                          physicalSources:
-                            - logicalSourceName: "bid"
-                              physicalSourceName: "bid_phy"
-                              type: TCP_SOURCE
-                              configuration:
-                                 socketHost: 192.168.1.100 #Set the host to connect to  (e.g. localhost)
-                                 socketPort:  8091 # Set the port to connect to
-                                 socketDomain:  AF_INET #Set the domain of the socket (e.g. AF_INET)
-                                 socketType: SOCK_STREAM #Set the type of the socket (e.g. SOCK_STREAM)
-                                 flushIntervalMS: 100 #Set the flushIntervalMS of the socket, if set to zero the buffer will only be flushed once full
-                                 inputFormat:  CSV #Set the input format of the socket (e.g. JSON, CSV)
-                                 decideMessageSize: TUPLE_SEPARATOR # Set the strategy for deciding the message size (e.g. TUPLE_SEPARATOR, USER_SPECIFIED_BUFFER_SIZE, BUFFER_SIZE_FROM_SOCKET)
-                        "##}.to_string()
+                        inline: Templates::worker_config(&wc),
                     },
                 },
                 FlatcarStorageFileConfig {
                     path: PathBuf::from("/etc/docker/daemon.json"),
                     contents: Content {
-                        inline: indoc! {r#"
-                          {
-                            "insecure-registries": ["192.168.1.100:5000"]
-                          }
-                        "#}.to_string()
+                        inline: Templates::docker_daemon(&wc),
                     },
                 },
-            ]
+            ],
+        },
+    }
+}
+
+pub(crate) async fn prepare_launch(
+    wc: &WorkerConfiguration,
+    tap: Tap,
+    args: &Args,
+) -> LaunchConfiguration {
+    let temp_dir = TempDir::new(&format!("worker_{}", wc.worker_id)).unwrap();
+    let image_path = temp_dir.path().join("flatcar_fresh.img");
+    let ignition_path = temp_dir.path().join("ignition.json");
+    let flatcar_config = create_configuration(wc);
+    let butane_output = run_butane(&flatcar_config);
+    std::fs::copy(&args.flatcar_fresh_image, &image_path).expect("Could not copy flatcar image");
+    let butane_output = butane_output.await;
+
+    let mut ignition_file =
+        std::fs::File::create(&ignition_path).expect("Could not create ignition.json");
+    ignition_file
+        .write_all(butane_output.as_ref())
+        .expect("Could not populate ignition.json");
+
+    LaunchConfiguration {
+        tap,
+        image_path,
+        temp_dir,
+        additional_args: vec![
+            "-fw_cfg".to_string(),
+            format!(
+                "name=opt/org.flatcar-linux/config,file={}",
+                ignition_path.to_str().unwrap()
+            ),
+        ],
+    }
+}
+
+#[test]
+fn should_serialize_properly() {
+    let worker_config = WorkerConfiguration {
+        ip_addr: Ipv4Addr::from([127, 0, 0, 1]),
+        host_ip_addr: Ipv4Addr::from([127, 0, 0, 1]),
+        parent_id: 0,
+        worker_id: 1,
+    };
+
+    let config = FlatcarConfig {
+        version: "1.0.0".to_string(),
+        variant: "flatcar".to_string(),
+        systemd: FlatcarSystemdConfig {
+            units: vec![FlatcarSystemdUnitConfig {
+                name: "nesWorker.service".to_string(),
+                enabled: true,
+                contents: Templates::docker_unit(&worker_config),
+            }],
+        },
+        storage: FlatcarStorageConfig {
+            files: vec![
+                FlatcarStorageFileConfig {
+                    path: PathBuf::from("/etc/systemd/network/00-eth0.network"),
+                    contents: Content {
+                        inline: Templates::network_config(&worker_config),
+                    },
+                },
+                FlatcarStorageFileConfig {
+                    path: PathBuf::from("/config/worker_config.yaml"),
+                    contents: Content {
+                        inline: Templates::worker_config(&worker_config),
+                    },
+                },
+                FlatcarStorageFileConfig {
+                    path: PathBuf::from("/etc/docker/daemon.json"),
+                    contents: Content {
+                        inline: Templates::docker_daemon(&worker_config),
+                    },
+                },
+            ],
         },
     };
 
