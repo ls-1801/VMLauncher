@@ -1,9 +1,9 @@
 use crate::shell::run_shell_command;
+use macaddr::MacAddr;
+use rand::random;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use macaddr::MacAddr;
 use tracing::warn;
-use rand::random;
 
 #[derive(Debug)]
 pub(crate) struct Bridge {
@@ -29,16 +29,16 @@ pub(crate) async fn network_setup() -> NetworkConfig {
 
 #[tracing::instrument]
 pub(crate) async fn network_cleanup(nc: NetworkConfig) {
-    nc.bridges.destroy().await;
-
     for tap in nc.taps {
         tap.destroy().await;
     }
+
+    nc.bridges.destroy().await;
 }
 
 impl Bridge {
     pub async fn find_all() -> Result<Vec<Bridge>, String> {
-        let output = Self::run_brctl_command("show", vec![]).await?;
+        let output = run_brctl_command("show", vec![]).await?;
         if output.is_empty() {
             return Ok(vec![]);
         }
@@ -59,7 +59,7 @@ impl Bridge {
     }
 
     pub async fn register_tap_device(&mut self, tap: &Tap) {
-        Self::run_brctl_command("addif", vec![&self.name, &tap.name])
+        run_brctl_command("addif", vec![&self.name, &tap.name])
             .await
             .expect("Could not register tap device at bridge");
     }
@@ -80,15 +80,15 @@ impl Bridge {
             }
         }
 
-        Self::run_brctl_command("addbr", vec![&name])
+        run_brctl_command("addbr", vec![&name])
             .await
             .expect("Could not create bridge");
 
-        Self::run_ip_command("link", vec!["set", "dev", &name, "up"])
+        run_ip_command("link", vec!["set", "dev", &name, "up"])
             .await
             .expect("Could not bring bridge up");
 
-        Self::run_ip_command(
+        run_ip_command(
             "addr",
             vec!["add", &format!("{}/24", ip_addr.to_string()), "dev", &name],
         )
@@ -98,67 +98,84 @@ impl Bridge {
     }
 
     async fn destroy(self) {
-        Self::run_ip_command("link", vec!["set", "dev", &self.name, "down"])
+        run_ip_command("link", vec!["set", "dev", &self.name, "down"])
             .await
             .expect("could not bring bridge down");
-        Self::run_brctl_command("delbr", vec![&self.name])
+        run_brctl_command("delbr", vec![&self.name])
             .await
             .expect("could not delete bridge");
     }
-
-    #[tracing::instrument]
-    async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, String> {
-        run_shell_command(
-            "/usr/bin/ip",
-            vec![command].into_iter().chain(args.into_iter()).collect(),
-        )
-        .await
-    }
-
-    #[tracing::instrument]
-    async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
-        run_shell_command(
-            "/usr/sbin/brctl",
-            vec![command].into_iter().chain(args.into_iter()).collect(),
-        )
-        .await
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Tap {
     pub(crate) name: String,
-    ip_addr: IpAddr,
+    pub(crate) ip_addr: IpAddr,
     pub(crate) mac_addr: MacAddr,
 }
 
 impl Tap {
     pub async fn create(name: String, ip_addr: IpAddr) -> Self {
-        Self::run_tunctl_command("-t", vec![&name, "-u", "ls"])
+        run_ip_command("tuntap", vec!["add", &name, "mode", "tap"])
             .await
-            .expect("Could not create tap device");
+            .expect("could not create tap device");
 
-        Tap { name, ip_addr, mac_addr: MacAddr::from([0x0, 0x60, 0x2f, random(), random(), random()]) }
+        run_ip_command("link", vec!["set", "dev", &name, "up"])
+            .await
+            .expect("Could not start");
+
+        Tap {
+            name,
+            ip_addr,
+            mac_addr: MacAddr::from([0x0, 0x60, 0x2f, random(), random(), random()]),
+        }
     }
 
     pub async fn destroy(self) {
-        Self::run_tunctl_command("-d", vec![&self.name])
+        run_ip_command("tuntap", vec!["del", &self.name, "mode", "tap"])
             .await
             .expect("Could not delete tap device");
     }
+}
 
-    #[tracing::instrument]
-    async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
-        run_shell_command(
-            "/usr/bin/tunctl",
-            vec![command].into_iter().chain(args.into_iter()).collect(),
-        )
-        .await
-    }
+#[tracing::instrument]
+async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+    run_shell_command(
+        "/usr/bin/ip",
+        vec![command].into_iter().chain(args.into_iter()).collect(),
+    )
+    .await
+}
+
+#[tracing::instrument]
+async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+    run_shell_command(
+        "/usr/sbin/brctl",
+        vec![command].into_iter().chain(args.into_iter()).collect(),
+    )
+    .await
+}
+
+#[tracing::instrument]
+async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+    run_shell_command(
+        "/usr/bin/tunctl",
+        vec![command].into_iter().chain(args.into_iter()).collect(),
+    )
+    .await
 }
 
 #[derive(Debug)]
 pub(crate) struct NetworkConfig {
     bridges: Bridge,
     taps: Vec<Tap>,
+}
+
+impl NetworkConfig {
+    pub(crate) fn host_ip(&self) -> &IpAddr {
+        &self.bridges.ip_addr
+    }
+    pub fn get_tap(&self) -> Tap {
+        self.taps[0].clone()
+    }
 }

@@ -35,4 +35,11 @@ sudo = "0.6.0"
 
 # util
 indoc = "2.0.4"
+strum = "0.26.1"
+strum_macros = "0.26.1"
 tempdir = "0.3.7"
+
+
+ctrlc = "3.4.2"
+
+async-std = "1.12.0"

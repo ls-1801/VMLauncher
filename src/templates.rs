@@ -1,3 +1,5 @@
+use crate::nes::Source;
+use indoc::indoc;
 use once_cell::unsync::Lazy;
 use ouroboros::self_referencing;
 use rust_embed::{EmbeddedFile, RustEmbed};
@@ -89,8 +91,79 @@ impl Templates {
 
 #[derive(Serialize)]
 pub(crate) struct WorkerConfiguration {
-    pub(crate) ip_addr: Ipv4Addr,
-    pub(crate) host_ip_addr: Ipv4Addr,
+    pub(crate) ip_addr: IpAddr,
+    pub(crate) host_ip_addr: IpAddr,
     pub(crate) worker_id: usize,
     pub(crate) parent_id: usize,
+    pub(crate) sources: Vec<Source>,
+}
+
+#[test]
+fn physical_sources() {
+    let wc = WorkerConfiguration {
+        ip_addr: IpAddr::from([10, 0, 0, 1]),
+        host_ip_addr: IpAddr::from([10, 0, 0, 2]),
+        worker_id: 0,
+        parent_id: 0,
+        sources: vec![],
+    };
+
+    assert_eq!(
+        &Templates::worker_config(&wc),
+        indoc! {r#"
+                logLevel: LOG_INFO
+                localWorkerIp: 10.0.0.1
+                coordinatorIp: 10.0.0.2
+                numberOfSlots: 2147483647
+                queryCompiler:
+                queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+                workerId: 0
+                parentId: 0
+                dataPort: 8432
+                numWorkerThreads: 1
+                rpcPort: 8433
+                coordinatorPort: 8434"#}
+    );
+
+    let wc = WorkerConfiguration {
+        ip_addr: IpAddr::from([10, 0, 0, 1]),
+        host_ip_addr: IpAddr::from([10, 0, 0, 2]),
+        worker_id: 0,
+        parent_id: 0,
+        sources: vec![Source::tcp_source(
+            "logical".to_string(),
+            "physical".to_string(),
+            IpAddr::from([10, 0, 0, 1]),
+            8080,
+            std::time::Duration::from_millis(100),
+        )],
+    };
+    assert_eq!(
+        &Templates::worker_config(&wc),
+        indoc! {r#"
+                logLevel: LOG_INFO
+                localWorkerIp: 10.0.0.1
+                coordinatorIp: 10.0.0.2
+                numberOfSlots: 2147483647
+                queryCompiler:
+                queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+                workerId: 0
+                parentId: 0
+                dataPort: 8432
+                numWorkerThreads: 1
+                rpcPort: 8433
+                coordinatorPort: 8434
+                physicalSources:
+                  - type: TCP_SOURCE
+                    configuration:
+                       socketHost: 10.0.0.1
+                       socketPort: 8080
+                       socketDomain: AF_INET
+                       socketType: SOCK_STREAM
+                       flushIntervalMS: 100
+                       inputFormat: CSV
+                       decideMessageSize: TUPLE_SEPARATOR
+                    logicalSourceName: logical
+                    physicalSourceName: physical"#}
+    );
 }

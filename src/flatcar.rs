@@ -1,9 +1,10 @@
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use serde::Serialize;
 use tempdir::TempDir;
+use tracing::{debug, info};
 
 use crate::network::Tap;
 use crate::qemu::LaunchConfiguration;
@@ -57,6 +58,7 @@ async fn run_butane(config: &FlatcarConfig) -> String {
     .expect("could not run docker")
 }
 
+#[derive(Clone)]
 pub struct Args {
     pub flatcar_fresh_image: PathBuf,
 }
@@ -69,7 +71,7 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
             units: vec![FlatcarSystemdUnitConfig {
                 name: "nesWorker.service".to_string(),
                 enabled: true,
-                contents: Templates::docker_unit(&wc),
+                contents: Templates::docker_unit(wc),
             }],
         },
         storage: FlatcarStorageConfig {
@@ -77,19 +79,19 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
                 FlatcarStorageFileConfig {
                     path: PathBuf::from("/etc/systemd/network/00-eth0.network"),
                     contents: Content {
-                        inline: Templates::network_config(&wc),
+                        inline: Templates::network_config(wc),
                     },
                 },
                 FlatcarStorageFileConfig {
-                    path: PathBuf::from("/config/workerConfiguration.yaml"),
+                    path: PathBuf::from("/config/worker_config.yaml"),
                     contents: Content {
-                        inline: Templates::worker_config(&wc),
+                        inline: Templates::worker_config(wc),
                     },
                 },
                 FlatcarStorageFileConfig {
                     path: PathBuf::from("/etc/docker/daemon.json"),
                     contents: Content {
-                        inline: Templates::docker_daemon(&wc),
+                        inline: Templates::docker_daemon(wc),
                     },
                 },
             ],
@@ -97,16 +99,17 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
     }
 }
 
-pub(crate) async fn prepare_launch(
+pub(crate) async fn prepare_launch<'network>(
     wc: &WorkerConfiguration,
-    tap: Tap,
+    tap: &'network Tap,
     args: &Args,
-) -> LaunchConfiguration {
+) -> LaunchConfiguration<'network> {
     let temp_dir = TempDir::new(&format!("worker_{}", wc.worker_id)).unwrap();
-    let image_path = temp_dir.path().join("flatcar_fresh.img");
+    let image_path = temp_dir.path().join("flatcar_fresh.iso");
     let ignition_path = temp_dir.path().join("ignition.json");
     let flatcar_config = create_configuration(wc);
     let butane_output = run_butane(&flatcar_config);
+    info!(src = ?args.flatcar_fresh_image, dest = ?image_path, tmp= ?temp_dir, "Copy image to tmp directory");
     std::fs::copy(&args.flatcar_fresh_image, &image_path).expect("Could not copy flatcar image");
     let butane_output = butane_output.await;
 
@@ -120,23 +123,17 @@ pub(crate) async fn prepare_launch(
         tap,
         image_path,
         temp_dir,
-        additional_args: vec![
-            "-fw_cfg".to_string(),
-            format!(
-                "name=opt/org.flatcar-linux/config,file={}",
-                ignition_path.to_str().unwrap()
-            ),
-        ],
     }
 }
 
 #[test]
 fn should_serialize_properly() {
     let worker_config = WorkerConfiguration {
-        ip_addr: Ipv4Addr::from([127, 0, 0, 1]),
-        host_ip_addr: Ipv4Addr::from([127, 0, 0, 1]),
+        ip_addr: IpAddr::from([127, 0, 0, 1]),
+        host_ip_addr: IpAddr::from([127, 0, 0, 1]),
         parent_id: 0,
         worker_id: 1,
+        sources: vec![]
     };
 
     let config = FlatcarConfig {
