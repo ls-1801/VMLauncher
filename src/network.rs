@@ -1,6 +1,8 @@
 use crate::shell::run_shell_command;
+use itertools::Itertools;
 use macaddr::MacAddr;
 use rand::random;
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use tracing::warn;
@@ -165,6 +167,108 @@ async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, St
     .await
 }
 
+struct IpAddressAllocator {
+    max_value: usize,
+    free: BTreeSet<(usize, usize)>,
+}
+
+impl IpAddressAllocator {
+    pub fn new(max_value: usize) -> Self {
+        Self {
+            max_value,
+            free: BTreeSet::from([(max_value, 1)]),
+        }
+    }
+
+    pub fn allocate(&mut self) -> Option<usize> {
+        if let Some((end, start)) = self.free.pop_first() {
+            if start != end {
+                self.free.insert((end, start + 1));
+            }
+            Some(start)
+        } else {
+            None
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.free.len() <= 1 {
+            return;
+        }
+
+        self.free = self
+            .free
+            .iter()
+            .cloned()
+            .tuple_windows()
+            .flat_map(|((c_end, c_start), (b_end, b_start))| {
+                if b_start == c_end + 1 {
+                    vec![(b_end, c_start)].into_iter()
+                } else {
+                    vec![(b_end, b_start), (c_end, c_start)].into_iter()
+                }
+            })
+            .collect();
+
+        if self.free.len() <= 1 {
+            return;
+        }
+
+        self.free = self
+            .free
+            .iter()
+            .cloned()
+            .tuple_windows()
+            .flat_map(|((bc_end, bc_start), (a_end, a_start))| {
+                if a_start == bc_end + 1{
+                    vec![(a_end, bc_start)].into_iter()
+                } else {
+                    vec![(a_end, a_start), (bc_end, bc_start)].into_iter()
+                }
+            })
+            .collect();
+
+    }
+    pub fn free(&mut self, id: usize) {
+        assert!(id <= self.max_value);
+        self.free.insert((id, id));
+        self.compact();
+        println!("After Compaction {:?}", self.free);
+    }
+}
+
+#[test]
+fn ip_allocation() {
+    let mut allocator = IpAddressAllocator::new(5);
+
+    assert_eq!(allocator.allocate(), Some(1));
+    assert_eq!(allocator.allocate(), Some(2));
+    assert_eq!(allocator.allocate(), Some(3));
+    assert_eq!(allocator.allocate(), Some(4));
+    assert_eq!(allocator.allocate(), Some(5));
+
+    allocator.free(3);
+    assert_eq!(allocator.allocate(), Some(3));
+
+
+    allocator.free(2);
+    allocator.free(4);
+
+    assert_eq!(allocator.allocate(), Some(2));
+    assert_eq!(allocator.allocate(), Some(4));
+
+
+    allocator.free(2);
+    allocator.free(4);
+    allocator.free(3);
+
+    assert_eq!(allocator.allocate(), Some(2));
+    assert_eq!(allocator.allocate(), Some(3));
+    allocator.free(5);
+    assert_eq!(allocator.allocate(), Some(4));
+    assert_eq!(allocator.allocate(), Some(5));
+}
+
 #[derive(Debug)]
 pub(crate) struct NetworkConfig {
     bridges: Bridge,
@@ -175,7 +279,7 @@ impl NetworkConfig {
     pub(crate) fn host_ip(&self) -> &IpAddr {
         &self.bridges.ip_addr
     }
-    pub fn get_tap(&self) -> Tap {
+    pub fn get_tap(&mut self) -> Tap {
         self.taps[0].clone()
     }
 }

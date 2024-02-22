@@ -11,6 +11,7 @@ dependencies = [
  "ctrlc",
  "futures-lite 2.2.0",
  "indoc",
+ "itertools",
  "macaddr",
  "once_cell",
  "ouroboros",
