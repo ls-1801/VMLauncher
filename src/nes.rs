@@ -10,9 +10,9 @@ struct ConfigItem {
 #[derive(Serialize)]
 pub(crate) struct Source {
     source_type: &'static str,
-    config: Vec<ConfigItem>,
     logical_source_name: String,
     physical_source_name: String,
+    config: Vec<ConfigItem>,
 }
 
 impl Source {

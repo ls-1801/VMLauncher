@@ -99,15 +99,15 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
     }
 }
 
-pub(crate) async fn prepare_launch<'network>(
-    wc: &WorkerConfiguration,
-    tap: &'network Tap,
+pub(crate) async fn prepare_launch(
+    wc: WorkerConfiguration,
+    tap: Tap,
     args: &Args,
-) -> LaunchConfiguration<'network> {
+) -> LaunchConfiguration {
     let temp_dir = TempDir::new(&format!("worker_{}", wc.worker_id)).unwrap();
     let image_path = temp_dir.path().join("flatcar_fresh.iso");
     let ignition_path = temp_dir.path().join("ignition.json");
-    let flatcar_config = create_configuration(wc);
+    let flatcar_config = create_configuration(&wc);
     let butane_output = run_butane(&flatcar_config);
     info!(src = ?args.flatcar_fresh_image, dest = ?image_path, tmp= ?temp_dir, "Copy image to tmp directory");
     std::fs::copy(&args.flatcar_fresh_image, &image_path).expect("Could not copy flatcar image");
@@ -133,7 +133,7 @@ fn should_serialize_properly() {
         host_ip_addr: IpAddr::from([127, 0, 0, 1]),
         parent_id: 0,
         worker_id: 1,
-        sources: vec![]
+        sources: vec![],
     };
 
     let config = FlatcarConfig {
