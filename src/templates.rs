@@ -116,13 +116,14 @@ fn physical_sources() {
                 coordinatorIp: 10.0.0.2
                 numberOfSlots: 2147483647
                 queryCompiler:
-                queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+                  queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
                 workerId: 0
                 parentId: 0
                 dataPort: 8432
                 numWorkerThreads: 1
                 rpcPort: 8433
-                coordinatorPort: 8434"#}
+                coordinatorPort: 8434
+                "#}
     );
 
     let wc = WorkerConfiguration {
@@ -146,7 +147,7 @@ fn physical_sources() {
                 coordinatorIp: 10.0.0.2
                 numberOfSlots: 2147483647
                 queryCompiler:
-                queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+                  queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
                 workerId: 0
                 parentId: 0
                 dataPort: 8432
@@ -154,16 +155,17 @@ fn physical_sources() {
                 rpcPort: 8433
                 coordinatorPort: 8434
                 physicalSources:
-                  - type: TCP_SOURCE
-                    configuration:
-                       socketHost: 10.0.0.1
-                       socketPort: 8080
-                       socketDomain: AF_INET
-                       socketType: SOCK_STREAM
-                       flushIntervalMS: 100
-                       inputFormat: CSV
-                       decideMessageSize: TUPLE_SEPARATOR
-                    logicalSourceName: logical
-                    physicalSourceName: physical"#}
+                 - type: TCP_SOURCE
+                   logicalSourceName: logical
+                   physicalSourceName: physical
+                   configuration:
+                     socketHost: 10.0.0.1
+                     socketPort: 8080
+                     socketDomain: AF_INET
+                     socketType: SOCK_STREAM
+                     flushIntervalMS: 100
+                     inputFormat: CSV
+                     decideMessageSize: TUPLE_SEPARATOR
+                "#}
     );
 }

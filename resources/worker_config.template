@@ -3,7 +3,7 @@ localWorkerIp: {ip_addr}
 coordinatorIp: {host_ip_addr}
 numberOfSlots: 2147483647
 queryCompiler:
-queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
+  queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
 workerId: {worker_id}
 parentId: {parent_id}
 dataPort: 8432
@@ -16,11 +16,11 @@ physicalSources:
 {{- endif }}
 {{- endfor }}
 {{- for source in sources }}
-  - type: {source.source_type}
-    configuration:
-       {{- for config in source.config }}
-       {config.key}: {config.value}
-       {{- endfor }}
-    logicalSourceName: {source.logical_source_name}
-    physicalSourceName: {source.physical_source_name}
-      {{- endfor }}
+ - type: {source.source_type}
+   logicalSourceName: {source.logical_source_name}
+   physicalSourceName: {source.physical_source_name}
+   configuration:
+     {{- for config in source.config }}
+     {config.key}: {config.value}
+     {{- endfor }}
+{{- endfor }}
