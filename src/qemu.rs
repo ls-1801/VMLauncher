@@ -1,16 +1,23 @@
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
+use async_process::Command;
+use async_std::io::{ReadExt, WriteExt};
+use async_std::os::unix::net::UnixStream;
+use async_std::task;
 use rand::random;
 use strum_macros::Display;
 use tempdir::TempDir;
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::network::Tap;
 use crate::qemu::MachineType::Q35;
 use crate::shell::run_shell_command;
 
-pub struct LaunchConfiguration<'network> {
-    pub(crate) tap: &'network Tap,
+#[derive(Debug)]
+pub struct LaunchConfiguration {
+    pub(crate) tap: Tap,
     pub(crate) image_path: PathBuf,
     pub(crate) temp_dir: TempDir,
 }
@@ -160,6 +167,7 @@ struct QemuRunMode {
     monitor: Option<QemuMonitor>,
     serial: Option<QemuSerial>,
     display: bool,
+    daemonize_pidfile: Option<PathBuf>,
 }
 
 impl QemuCommandLineArgs for QemuRunMode {
@@ -175,9 +183,15 @@ impl QemuCommandLineArgs for QemuRunMode {
                     .flat_map(|s| s.into_iter()),
             )
             .chain(
+                self.daemonize_pidfile
+                    .iter()
+                    .map(|pid_file| ["-daemonize", "-pidfile", pid_file.to_str().unwrap()])
+                    .flat_map(|s| s.into_iter().map(|s| s.to_string())),
+            )
+            .chain(
                 bool_option(!self.display)
                     .into_iter()
-                    .map(|_| ["-display", "none", "-nographic", "-vga", "none"])
+                    .map(|_| ["-display", "none", "-vga", "none"])
                     .flat_map(|s| s.into_iter().map(|s| s.to_string())),
             )
     }
@@ -265,6 +279,7 @@ fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
             serial_socket_path: lc.temp_dir.path().join("serial.socket"),
         }),
         display: false,
+        daemonize_pidfile: Some(lc.temp_dir.path().join("pidfile")),
     };
 
     let qv = QemuVirtualizationMode {
@@ -297,7 +312,66 @@ fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
         .collect()
 }
 
-pub async fn start_qemu(lc: &LaunchConfiguration<'_>) {
+#[instrument]
+pub async fn stop_qemu(lc: LaunchConfiguration) {
+    let mut buf = vec![0; 64];
+    let len = async_std::fs::File::open(lc.temp_dir.path().join("pidfile"))
+        .await
+        .unwrap()
+        .read(&mut buf)
+        .await
+        .unwrap();
+    assert!(len > 0);
+    let pid = std::str::from_utf8(&buf[0..len - 1]).unwrap();
+    info!(pid, "Fetching Pid");
+    let pid = pid.parse::<usize>().unwrap();
+
+    let monitor = lc.temp_dir.path().join("monitor.socket");
+    let mut monitor_socket = UnixStream::connect(monitor)
+        .await
+        .expect("Could not open monitor socket");
+    monitor_socket
+        .write_all("q\n".as_bytes())
+        .await
+        .expect("Could not write to socket");
+
+    let start_time = Instant::now();
+    let timeout_duration = Duration::from_secs(2);
+    loop {
+        let pid_exists = Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|b| b.success())
+            .unwrap_or(false);
+
+        if !pid_exists {
+            return;
+        }
+
+        let elapsed = start_time.elapsed();
+        if elapsed >= timeout_duration {
+            break;
+        }
+
+        let _ = task::sleep(Duration::from_millis(200)).await;
+    }
+
+    let status = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .unwrap();
+
+    assert!(status.success());
+}
+
+#[instrument]
+pub async fn start_qemu(lc: &LaunchConfiguration) {
     run_shell_command(
         QEMU_BINARY,
         create_qemu_arguments(lc)
