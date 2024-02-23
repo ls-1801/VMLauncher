@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -9,48 +10,30 @@ use async_std::task;
 use rand::random;
 use strum_macros::Display;
 use tempdir::TempDir;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
-use crate::network::Tap;
+use crate::network::TapUser;
 use crate::qemu::MachineType::Q35;
 use crate::shell::run_shell_command;
 
 #[derive(Debug)]
-pub struct LaunchConfiguration {
-    pub(crate) tap: Tap,
+pub struct LaunchConfiguration<'nc> {
+    pub(crate) tap: TapUser<'nc>,
     pub(crate) image_path: PathBuf,
     pub(crate) temp_dir: TempDir,
+    pub(crate) firmware: Vec<QemuFirmwareConfig>,
 }
 
 const QEMU_BINARY: &str = "qemu-system-x86_64";
-
-// qemu-system-x86_64
-//     -name flatcar_production_qemu-3602-2-3
-//     -m 1024
-// // net
-//     -netdev tap,id=eth0,ifname=tap0,script=no,downscript=no
-//     -device virtio-net-pci,netdev=eth0,mac=00-60-2F-00-00-00
-// // rng
-//     -object rng-random,filename=/dev/urandom,id=rng0
-//     -device virtio-rng-pci,rng=rng0
-//
-// //fs
-//     -fw_cfg name=opt/org.flatcar-linux/config,file=ignition.json
-//     -drive if=virtio,file=/home/ls/dima/flatcar/flatcar_production_qemu_image.img
-//     -fsdev local,id=conf,security_model=none,readonly=on,path=/tmp/tmp.hM5SnnwK3x
-//     -device virtio-9p-pci,fsdev=conf,mount_tag=config-2
-//
-//     -machine accel=kvm:tcg
-//     -cpu host
-//     -smp 8
 
 trait QemuCommandLineArgs {
     fn as_args(&self) -> impl Iterator<Item = String>;
 }
 
-struct QemuFirmwareConfig {
-    name: String,
-    path: PathBuf,
+#[derive(Debug, Clone)]
+pub struct QemuFirmwareConfig {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
 }
 
 impl QemuCommandLineArgs for QemuFirmwareConfig {
@@ -86,12 +69,12 @@ impl QemuCommandLineArgs for MountedFilesystem {
     }
 }
 
-struct QemuConfig<'tap> {
+struct QemuConfig<'tap, 'nc: 'tap> {
     name: Option<String>,
     memory_in_megabytes: Option<usize>,
     number_of_cores: Option<usize>,
     rng_device: bool,
-    tap: Option<&'tap Tap>,
+    tap: Option<&'tap TapUser<'nc>>,
     firmware: Vec<QemuFirmwareConfig>,
     virtio_drives: Vec<PathBuf>,
     mounted_filesystems: Vec<MountedFilesystem>,
@@ -105,7 +88,7 @@ fn bool_option(b: bool) -> Option<()> {
     }
 }
 
-impl QemuCommandLineArgs for QemuConfig<'_> {
+impl QemuCommandLineArgs for QemuConfig<'_, '_> {
     fn as_args(&self) -> impl Iterator<Item = String> {
         self.virtio_drives
             .iter()
@@ -150,12 +133,12 @@ impl QemuCommandLineArgs for QemuConfig<'_> {
                 self.tap
                     .iter()
                     .map(|t| {
-                        info!(interface_name = t.name, mac = %t.mac_addr, "Attaching Tap Device");
+                        info!(interface_name = t.device(), mac = %t.mac(), "Attaching Tap Device");
                         [
                             "-netdev".to_string(),
-                            format!("tap,id=eth0,ifname={},script=no,downscript=no", t.name),
+                            format!("tap,id=eth0,ifname={},script=no,downscript=no", t.device()),
                             "-device".to_string(),
-                            format!("virtio-net-pci,netdev=eth0,mac={}", t.mac_addr),
+                            format!("virtio-net-pci,netdev=eth0,mac={}", t.mac()),
                         ]
                     })
                     .flat_map(|a| a.into_iter()),
@@ -270,7 +253,7 @@ impl QemuCommandLineArgs for QemuSerial {
     }
 }
 
-fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
+fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
     let qr = QemuRunMode {
         monitor: Some(QemuMonitor {
             monitor_socket_path: lc.temp_dir.path().join("monitor.socket"),
@@ -294,10 +277,7 @@ fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
         number_of_cores: Some(2),
         rng_device: true,
         tap: Some(&lc.tap),
-        firmware: vec![QemuFirmwareConfig {
-            name: "opt/org.flatcar-linux/config".to_string(),
-            path: lc.temp_dir.path().join("ignition.json"),
-        }],
+        firmware: lc.firmware.clone(),
         virtio_drives: vec![lc.image_path.clone()],
         mounted_filesystems: vec![MountedFilesystem {
             mount_tag: "config-2".to_string(),
@@ -313,8 +293,19 @@ fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
 }
 
 #[instrument]
-pub async fn stop_qemu(lc: LaunchConfiguration) {
+async fn stop_qemu(lc: LaunchConfiguration<'_>) {
     let mut buf = vec![0; 64];
+
+    match async_std::fs::File::open(lc.temp_dir.path().join("pidfile")).await {
+        Ok(mut f) => {
+            f.read(&mut buf);
+        }
+        Err(e) => {
+            warn!(&e, "Can't read pid file, assuming the vm has already been stopped");
+            return;
+        }
+    }
+
     let len = async_std::fs::File::open(lc.temp_dir.path().join("pidfile"))
         .await
         .unwrap()
@@ -370,15 +361,37 @@ pub async fn stop_qemu(lc: LaunchConfiguration) {
     assert!(status.success());
 }
 
+pub struct QemuProcessHandle<'nc> {
+    lc: Option<LaunchConfiguration<'nc>>,
+}
+
+impl<'nc> Display for QemuProcessHandle<'nc> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "TapDevice: {}, Ip: {}",
+            self.lc.as_ref().unwrap().tap.device(),
+            self.lc.as_ref().unwrap().tap.ip()
+        ))
+    }
+}
+
+impl<'nc> Drop for QemuProcessHandle<'nc> {
+    fn drop(&mut self) {
+        task::block_on(stop_qemu(self.lc.take().unwrap()))
+    }
+}
+
 #[instrument]
-pub async fn start_qemu(lc: &LaunchConfiguration) {
+pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> QemuProcessHandle<'nc> {
     run_shell_command(
         QEMU_BINARY,
-        create_qemu_arguments(lc)
+        create_qemu_arguments(&lc)
             .iter()
             .map(|s| s.as_ref())
             .collect(),
     )
     .await
     .expect("Could not run qemu");
+
+    QemuProcessHandle { lc: Some(lc) }
 }

@@ -1,13 +1,13 @@
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::Serialize;
 use tempdir::TempDir;
-use tracing::{debug, info};
+use tracing::info;
 
-use crate::network::Tap;
-use crate::qemu::LaunchConfiguration;
+use crate::network::TapUser;
+use crate::qemu::{LaunchConfiguration, QemuFirmwareConfig};
 use crate::shell::run_shell_command_with_stdin;
 use crate::templates::{Templates, WorkerConfiguration};
 
@@ -99,16 +99,16 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
     }
 }
 
-pub(crate) async fn prepare_launch(
+pub(crate) async fn prepare_launch<'nc>(
     wc: WorkerConfiguration,
-    tap: Tap,
+    tap: TapUser<'nc>,
     args: &Args,
-) -> LaunchConfiguration {
+) -> LaunchConfiguration<'nc> {
     let temp_dir = TempDir::new(&format!("worker_{}", wc.worker_id)).unwrap();
     let image_path = temp_dir.path().join("flatcar_fresh.iso");
     let ignition_path = temp_dir.path().join("ignition.json");
     let flatcar_config = create_configuration(&wc);
-    let butane_output = run_butane(&flatcar_config);
+    let butane_output = run_butane(dbg!(&flatcar_config));
     info!(src = ?args.flatcar_fresh_image, dest = ?image_path, tmp= ?temp_dir, "Copy image to tmp directory");
     std::fs::copy(&args.flatcar_fresh_image, &image_path).expect("Could not copy flatcar image");
     let butane_output = butane_output.await;
@@ -122,6 +122,10 @@ pub(crate) async fn prepare_launch(
     LaunchConfiguration {
         tap,
         image_path,
+        firmware: vec![QemuFirmwareConfig {
+            name: "opt/org.flatcar-linux/config".to_string(),
+            path: temp_dir.path().join("ignition.json"),
+        }],
         temp_dir,
     }
 }
