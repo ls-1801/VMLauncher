@@ -38,6 +38,8 @@ indoc = "2.0.4"
 strum = "0.26.1"
 strum_macros = "0.26.1"
 tempdir = "0.3.7"
+thiserror = "1.0.57"
+tracing-error = "0.2.0"
 
 
 ctrlc = "3.4.2"
@@ -52,3 +54,4 @@ clap = { version = "4.4.18", features = ["derive"] }
 homedir = "0.2.1"
 
 camino = "1.1.6"
+which = "6.0.0"

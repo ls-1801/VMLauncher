@@ -8,10 +8,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use inquire::{CustomType, InquireError};
 use ipnet::Ipv4Net;
+use thiserror::Error;
 use tracing::{error, info};
 
 use crate::network::{network_cleanup, network_setup, NetworkConfig};
-use crate::qemu::{start_qemu, QemuProcessHandle};
+use crate::qemu::{start_qemu, QemuError, QemuProcessHandle};
 use crate::templates::WorkerConfiguration;
 
 mod flatcar;
@@ -28,13 +29,30 @@ struct Args {
     ip_range: Option<Ipv4Net>,
 }
 
-fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, InquireError> {
-    let node_id = inquire::CustomType::<usize>::new("NodeId?").prompt()?;
-    let query_id = inquire::CustomType::<usize>::new("WorkerId?").prompt()?;
-    let path_to_binary = inquire::CustomType::<Utf8PathBuf>::new("Binary?").prompt()?;
+#[derive(Error, Debug)]
+enum Error {
+    #[error("Command Prompt Error")]
+    Inquire(#[source] InquireError),
+    #[error("Qemu Error")]
+    Nanos(#[source] nanos::NanosError),
+    #[error("Qemu Error")]
+    Qemu(#[source] QemuError),
+}
+
+fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
+    let node_id = inquire::CustomType::<usize>::new("NodeId?")
+        .prompt()
+        .map_err(Error::Inquire)?;
+    let query_id = inquire::CustomType::<usize>::new("WorkerId?")
+        .prompt()
+        .map_err(Error::Inquire)?;
+    let path_to_binary = inquire::CustomType::<Utf8PathBuf>::new("Binary?")
+        .prompt()
+        .map_err(Error::Inquire)?;
 
     let args = inquire::Text::new("args")
-        .prompt_skippable()?;
+        .prompt_skippable()
+        .map_err(Error::Inquire)?;
 
     let wc = nanos::UnikernelWorkerConfig {
         node_id,
@@ -43,15 +61,19 @@ fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, InquireError> 
         args,
     };
 
-    Ok(task::block_on(async move {
+    task::block_on(async move {
         let tap = nc.get_tap().await;
-        let lc = nanos::prepare_launch(wc, tap, &nanos::Args {}).await;
-        start_qemu(lc).await
-    }))
+        let lc = nanos::prepare_launch(wc, tap, &nanos::Args {})
+            .await
+            .map_err(Error::Nanos)?;
+        start_qemu(lc).await.map_err(Error::Qemu)
+    })
 }
 
-fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, InquireError> {
-    let worker_id = inquire::CustomType::<usize>::new("WorkerId?").prompt()?;
+fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
+    let worker_id = inquire::CustomType::<usize>::new("WorkerId?")
+        .prompt()
+        .map_err(Error::Inquire)?;
 
     let tap = task::block_on(nc.get_tap());
     let worker_config = WorkerConfiguration {
@@ -67,14 +89,14 @@ fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, InquireError> {
             std::time::Duration::from_millis(100),
         )],
     };
-    Ok(task::block_on(async move {
+    task::block_on(async move {
         let wc = worker_config;
         let args = flatcar::Args {
             flatcar_fresh_image: PathBuf::from("./flatcar_fresh.iso"),
         };
         let lc = flatcar::prepare_launch(wc, tap, &args).await;
-        qemu::start_qemu(lc).await
-    }))
+        qemu::start_qemu(lc).await.map_err(Error::Qemu)
+    })
 }
 
 fn main() {

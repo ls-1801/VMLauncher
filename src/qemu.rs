@@ -10,10 +10,12 @@ use async_std::task;
 use rand::random;
 use strum_macros::Display;
 use tempdir::TempDir;
+use thiserror::Error;
 use tracing::{info, instrument, warn};
 
 use crate::network::TapUser;
 use crate::qemu::MachineType::Q35;
+use crate::shell;
 use crate::shell::run_shell_command;
 
 #[derive(Debug)]
@@ -301,7 +303,10 @@ async fn stop_qemu(lc: LaunchConfiguration<'_>) {
             f.read(&mut buf);
         }
         Err(e) => {
-            warn!(&e, "Can't read pid file, assuming the vm has already been stopped");
+            warn!(
+                ?e,
+                "Can't read pid file, assuming the vm has already been stopped"
+            );
             return;
         }
     }
@@ -381,8 +386,16 @@ impl<'nc> Drop for QemuProcessHandle<'nc> {
     }
 }
 
+type Result<T> = core::result::Result<T, QemuError>;
+
+#[derive(Error, Debug)]
+pub enum QemuError {
+    #[error("When spawning qemu command")]
+    Shell(#[source] shell::ShellError),
+}
+
 #[instrument]
-pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> QemuProcessHandle<'nc> {
+pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> Result<QemuProcessHandle<'nc>> {
     run_shell_command(
         QEMU_BINARY,
         create_qemu_arguments(&lc)
@@ -391,7 +404,7 @@ pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> QemuProcessHandle<
             .collect(),
     )
     .await
-    .expect("Could not run qemu");
+    .map_err(|e| QemuError::Shell(e))?;
 
-    QemuProcessHandle { lc: Some(lc) }
+    Ok(QemuProcessHandle { lc: Some(lc) })
 }

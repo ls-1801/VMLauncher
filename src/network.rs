@@ -10,7 +10,7 @@ use macaddr::MacAddr;
 use rand::random;
 use tracing::warn;
 
-use crate::shell::run_shell_command;
+use crate::shell::{run_shell_command, ShellError};
 
 #[derive(Debug)]
 struct Bridge {
@@ -46,7 +46,7 @@ impl Bridge {
         let ip = inet_line.unwrap().split_whitespace().nth(1);
         Ok(str::parse(ip.unwrap()).unwrap())
     }
-    async fn find_all() -> Result<Vec<Bridge>, String> {
+    async fn find_all() -> Result<Vec<Bridge>, ShellError> {
         let output = run_brctl_command("show", vec![]).await?;
         if output.is_empty() {
             return Ok(vec![]);
@@ -171,7 +171,7 @@ impl Tap {
 }
 
 #[tracing::instrument]
-async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/ip",
         vec![command].into_iter().chain(args.into_iter()).collect(),
@@ -180,7 +180,7 @@ async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, String
 }
 
 #[tracing::instrument]
-async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/sbin/brctl",
         vec![command].into_iter().chain(args.into_iter()).collect(),
@@ -189,7 +189,7 @@ async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, Str
 }
 
 #[tracing::instrument]
-async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, String> {
+async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/tunctl",
         vec![command].into_iter().chain(args.into_iter()).collect(),
