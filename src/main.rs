@@ -1,6 +1,8 @@
+use async_std::future::timeout;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::nes::Source;
 use async_std::task;
@@ -12,7 +14,7 @@ use thiserror::Error;
 use tracing::{error, info};
 
 use crate::network::{network_cleanup, network_setup, NetworkConfig};
-use crate::qemu::{start_qemu, QemuError, QemuProcessHandle};
+use crate::qemu::{serial, start_qemu, QemuError, QemuProcessHandle, SerialError};
 use crate::templates::WorkerConfiguration;
 
 mod flatcar;
@@ -37,6 +39,8 @@ enum Error {
     Nanos(#[source] nanos::NanosError),
     #[error("Qemu Error")]
     Qemu(#[source] QemuError),
+    #[error("Qemu Error while listening to serial")]
+    QemuSerial(#[source] SerialError),
 }
 
 fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
@@ -66,7 +70,14 @@ fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
         let lc = nanos::prepare_launch(wc, tap, &nanos::Args {})
             .await
             .map_err(Error::Nanos)?;
-        start_qemu(lc).await.map_err(Error::Qemu)
+        let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
+        match timeout(Duration::from_secs(10), serial(&handle)).await {
+            Err(_) => {
+                Ok(handle)
+            }
+            Ok(Ok(())) => unreachable!(),
+            Ok(Err(e)) => Err(Error::QemuSerial(e)),
+        }
     })
 }
 
