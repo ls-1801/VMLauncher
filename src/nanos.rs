@@ -40,7 +40,7 @@ pub(crate) async fn prepare_launch<'nc>(
     args: &Args,
 ) -> Result<LaunchConfiguration<'nc>, NanosError> {
     let image_name = worker_configuration.image_name();
-    let temp_dir = tempdir::TempDir::new(&image_name).map_err(|e| NanosError::FileSystem(e))?;
+    let temp_dir = tempdir::TempDir::new(&image_name).map_err(NanosError::FileSystem)?;
     let dest_image_path = temp_dir.path().join(&image_name);
     let ip_string = tap.ip().to_string();
     let mut ops_args = vec![
@@ -48,8 +48,6 @@ pub(crate) async fn prepare_launch<'nc>(
         worker_configuration.elf_binary.to_string(),
         "--ip-address".to_string(),
         ip_string,
-        "-p".to_string(),
-        "8080".to_string(),
         "-i".to_string(),
         image_name.clone(),
     ];
