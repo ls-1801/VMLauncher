@@ -1,12 +1,13 @@
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::str::from_utf8;
 use std::time::{Duration, Instant};
 
 use async_process::Command;
 use async_std::io::{ReadExt, WriteExt};
 use async_std::os::unix::net::UnixStream;
-use async_std::task;
+use async_std::{io, task};
 use rand::random;
 use strum_macros::Display;
 use tempdir::TempDir;
@@ -392,6 +393,48 @@ type Result<T> = core::result::Result<T, QemuError>;
 pub enum QemuError {
     #[error("When spawning qemu command")]
     Shell(#[source] shell::ShellError),
+}
+
+#[derive(Error, Debug)]
+pub enum SerialError {
+    #[error("While connecting")]
+    Connecting(#[source] std::io::Error),
+    #[error("While reading")]
+    Reading(#[source] std::io::Error),
+    #[error("While reading utf8")]
+    UTF8(#[source] std::str::Utf8Error),
+}
+
+pub async fn serial<'nc>(handle: &QemuProcessHandle<'nc>) -> core::result::Result<(), SerialError> {
+    let serial_socket = handle
+        .lc
+        .as_ref()
+        .unwrap()
+        .temp_dir
+        .path()
+        .join("serial.socket");
+    let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
+    let mut connection = connection.map_err(SerialError::Connecting)?;
+
+    let mut buf = vec![0u8; 1000];
+    loop {
+        dbg!("loop");
+        let result = io::timeout(Duration::from_secs(1), connection.read(&mut buf)).await;
+
+        let result = match result {
+            Err(e) => {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    continue;
+                } else {
+                    return Err(SerialError::Reading(e));
+                }
+            }
+            Ok(r) => r,
+        };
+
+        let output = from_utf8(&buf[0..result]).map_err(SerialError::UTF8)?;
+        print!("{}", output);
+    }
 }
 
 #[instrument]
