@@ -276,8 +276,8 @@ fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
 
     let qc = QemuConfig {
         name: None,
-        memory_in_megabytes: Some(2048),
-        number_of_cores: Some(2),
+        memory_in_megabytes: Some(16000),
+        number_of_cores: Some(8),
         rng_device: true,
         tap: Some(&lc.tap),
         firmware: lc.firmware.clone(),
