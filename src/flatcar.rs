@@ -138,6 +138,8 @@ fn should_serialize_properly() {
         parent_id: 0,
         worker_id: 1,
         sources: vec![],
+        log_level: "LOG_INFO",
+        query_processing: Default::default(),
     };
 
     let config = FlatcarConfig {

@@ -1,11 +1,15 @@
-use crate::nes::Source;
+use std::net::IpAddr;
+
 use indoc::indoc;
 use once_cell::unsync::Lazy;
 use ouroboros::self_referencing;
 use rust_embed::{EmbeddedFile, RustEmbed};
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr};
 use tinytemplate::TinyTemplate;
+
+use crate::nes::{
+    Source, WorkerQueryProcessingConfigurationBuilder, WorkerQueryProcessingConfigurationInternal,
+};
 
 thread_local! {
 pub static TEMPLATES: Lazy<Templates> = Lazy::new(Templates::create);
@@ -96,6 +100,8 @@ pub(crate) struct WorkerConfiguration {
     pub(crate) worker_id: usize,
     pub(crate) parent_id: usize,
     pub(crate) sources: Vec<Source>,
+    pub(crate) log_level: &'static str,
+    pub(crate) query_processing: WorkerQueryProcessingConfigurationInternal,
 }
 
 #[test]
@@ -106,6 +112,16 @@ fn physical_sources() {
         worker_id: 0,
         parent_id: 0,
         sources: vec![],
+        log_level: "LOG_INFO",
+        query_processing: WorkerQueryProcessingConfigurationBuilder::default()
+            .buffer_size(8192)
+            .total_number_of_buffers(4096)
+            .number_of_source_buffers(32)
+            .number_of_buffers_per_thread(128)
+            .number_of_worker_threads(8)
+            .build()
+            .unwrap()
+            .into(),
     };
 
     assert_eq!(
@@ -115,12 +131,14 @@ fn physical_sources() {
                 localWorkerIp: 10.0.0.1
                 coordinatorIp: 10.0.0.2
                 numberOfSlots: 2147483647
+                numWorkerThreads: 8
+                bufferSizeInBytes: 8192
+                numberOfBuffersPerWorker: 128
                 queryCompiler:
                   queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
                 workerId: 0
                 parentId: 0
                 dataPort: 8432
-                numWorkerThreads: 1
                 rpcPort: 8433
                 coordinatorPort: 8434
                 "#}
@@ -131,6 +149,7 @@ fn physical_sources() {
         host_ip_addr: IpAddr::from([10, 0, 0, 2]),
         worker_id: 0,
         parent_id: 0,
+        log_level: "LOG_DEBUG",
         sources: vec![Source::tcp_source(
             "logical".to_string(),
             "physical".to_string(),
@@ -138,11 +157,12 @@ fn physical_sources() {
             8080,
             std::time::Duration::from_millis(100),
         )],
+        query_processing: WorkerQueryProcessingConfigurationInternal::default(),
     };
     assert_eq!(
         &Templates::worker_config(&wc),
         indoc! {r#"
-                logLevel: LOG_INFO
+                logLevel: LOG_DEBUG
                 localWorkerIp: 10.0.0.1
                 coordinatorIp: 10.0.0.2
                 numberOfSlots: 2147483647
@@ -151,7 +171,6 @@ fn physical_sources() {
                 workerId: 0
                 parentId: 0
                 dataPort: 8432
-                numWorkerThreads: 1
                 rpcPort: 8433
                 coordinatorPort: 8434
                 physicalSources:

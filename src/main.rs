@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::nes::Source;
+use crate::nes::{Source, WorkerQueryProcessingConfigurationBuilder};
 use async_std::task;
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
@@ -72,9 +72,7 @@ fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
             .map_err(Error::Nanos)?;
         let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
         match timeout(Duration::from_secs(10), serial(&handle)).await {
-            Err(_) => {
-                Ok(handle)
-            }
+            Err(_) => Ok(handle),
             Ok(Ok(())) => unreachable!(),
             Ok(Err(e)) => Err(Error::QemuSerial(e)),
         }
@@ -95,10 +93,20 @@ fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
         sources: vec![Source::tcp_source(
             "nexmark_bid".to_string(),
             format!("nexmark_bid_{}", worker_id),
-            IpAddr::from([10, 0, 0, 0]),
+            IpAddr::from([10, 0, 0, 1]),
             8080,
             std::time::Duration::from_millis(100),
         )],
+        log_level: "LOG_INFO",
+        query_processing: WorkerQueryProcessingConfigurationBuilder::default()
+            .number_of_worker_threads(8)
+            .buffer_size(8192)
+            .number_of_source_buffers(128)
+            .total_number_of_buffers(4096)
+            .number_of_buffers_per_thread(128)
+            .build()
+            .unwrap()
+            .into(),
     };
     task::block_on(async move {
         let wc = worker_config;

@@ -1,13 +1,15 @@
-logLevel: LOG_INFO
+logLevel: {log_level}
 localWorkerIp: {ip_addr}
 coordinatorIp: {host_ip_addr}
 numberOfSlots: 2147483647
+{{- for config in query_processing.config }}
+{config.key}: {config.value}
+{{- endfor }}
 queryCompiler:
   queryCompilerNautilusBackendConfig: MLIR_COMPILER_BACKEND
 workerId: {worker_id}
 parentId: {parent_id}
 dataPort: 8432
-numWorkerThreads: 1
 rpcPort: 8433
 coordinatorPort: 8434
 {{- for source in sources }}

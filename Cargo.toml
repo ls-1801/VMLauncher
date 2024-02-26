@@ -55,3 +55,4 @@ homedir = "0.2.1"
 
 camino = "1.1.6"
 which = "6.0.0"
+derive_builder = "0.20.0"
