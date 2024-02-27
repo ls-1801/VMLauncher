@@ -133,3 +133,23 @@ pub async fn run_shell_command(command: &str, args: Vec<&str>) -> Result<String>
 
     return Ok(stdout.to_string());
 }
+
+#[tracing::instrument]
+pub async fn run_command_without_output(command: &str, args: Vec<&str>) -> Result<bool> {
+    println!("{command} {}", args.join(" "));
+    let mut child = Command::new(
+        which::which(command).map_err(|e| ShellError::new(ShellErrorEnum::BinaryNotFound(e)))?,
+    )
+    .args(args)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null())
+    .spawn()
+    .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
+    let exit_status = child
+        .status()
+        .await
+        .map_err(|e| ShellError::new(ShellErrorEnum::IOFailed(e)))?;
+
+    return Ok(exit_status.success());
+}

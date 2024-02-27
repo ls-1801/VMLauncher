@@ -1,23 +1,24 @@
-use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::str::from_utf8;
-use std::time::{Duration, Instant};
-
-use async_process::Command;
 use async_std::io::{ReadExt, WriteExt};
 use async_std::os::unix::net::UnixStream;
 use async_std::{io, task};
 use rand::random;
+use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::ExitStatus;
+use std::str::from_utf8;
+use std::time::Duration;
 use strum_macros::Display;
 use tempdir::TempDir;
 use thiserror::Error;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 use crate::network::TapUser;
 use crate::qemu::MachineType::Q35;
 use crate::shell;
-use crate::shell::run_shell_command;
+use crate::shell::{run_command_without_output, run_shell_command};
 
 #[derive(Debug)]
 pub struct LaunchConfiguration<'nc> {
@@ -295,80 +296,123 @@ fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
         .collect()
 }
 
-#[instrument]
-async fn stop_qemu(lc: LaunchConfiguration<'_>) {
-    let mut buf = vec![0; 64];
-
-    match async_std::fs::File::open(lc.temp_dir.path().join("pidfile")).await {
-        Ok(mut f) => {
-            f.read(&mut buf);
-        }
-        Err(e) => {
-            warn!(
-                ?e,
-                "Can't read pid file, assuming the vm has already been stopped"
-            );
-            return;
-        }
-    }
-
-    let len = async_std::fs::File::open(lc.temp_dir.path().join("pidfile"))
-        .await
-        .unwrap()
-        .read(&mut buf)
-        .await
-        .unwrap();
-    assert!(len > 0);
-    let pid = std::str::from_utf8(&buf[0..len - 1]).unwrap();
-    info!(pid, "Fetching Pid");
-    let pid = pid.parse::<usize>().unwrap();
-
-    let monitor = lc.temp_dir.path().join("monitor.socket");
-    let mut monitor_socket = UnixStream::connect(monitor)
-        .await
-        .expect("Could not open monitor socket");
-    monitor_socket
-        .write_all("q\n".as_bytes())
-        .await
-        .expect("Could not write to socket");
-
-    let start_time = Instant::now();
-    let timeout_duration = Duration::from_secs(2);
-    loop {
-        let pid_exists = Command::new("ps")
-            .arg("-p")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|b| b.success())
-            .unwrap_or(false);
-
-        if !pid_exists {
-            return;
-        }
-
-        let elapsed = start_time.elapsed();
-        if elapsed >= timeout_duration {
-            break;
-        }
-
-        let _ = task::sleep(Duration::from_millis(200)).await;
-    }
-
-    let status = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .status()
-        .await
-        .unwrap();
-
-    assert!(status.success());
-}
-
+#[derive(Debug)]
 pub struct QemuProcessHandle<'nc> {
     lc: Option<LaunchConfiguration<'nc>>,
+}
+
+struct PidNoLongerExists {
+    pid: usize,
+    ps_process_future: Option<Pin<Box<dyn Future<Output = io::Result<ExitStatus>>>>>,
+}
+
+impl<'nc> QemuProcessHandle<'nc> {
+    fn monitor_path(&self) -> PathBuf {
+        self.lc
+            .as_ref()
+            .expect("invalid state")
+            .temp_dir
+            .path()
+            .join("monitor.socket")
+    }
+    fn serial_path(&self) -> PathBuf {
+        self.lc
+            .as_ref()
+            .expect("invalid state")
+            .temp_dir
+            .path()
+            .join("serial.socket")
+    }
+    fn pid_file_path(&self) -> PathBuf {
+        self.lc
+            .as_ref()
+            .expect("invalid state")
+            .temp_dir
+            .path()
+            .join("pidfile")
+    }
+
+    #[instrument]
+    pub(crate) async fn restart(&mut self) -> Result<()> {
+        self.lc = start_qemu(self.lc.take().unwrap()).await?.lc.take();
+        Ok(())
+    }
+    #[instrument]
+    pub(crate) async fn stop(&self) -> Result<()> {
+        if !self.is_running().await? {
+            return Ok(());
+        }
+
+        let pid = self.get_pid().await?;
+        let mut monitor_socket = UnixStream::connect(self.monitor_path())
+            .await
+            .expect("Could not open monitor socket");
+        monitor_socket
+            .write_all("q\n".as_bytes())
+            .await
+            .expect("Could not write to socket");
+
+        let wait_until_pid_stops_existing = async {
+            while run_command_without_output("ps", vec!["-p", &pid.to_string()]).await? {}
+            Ok(())
+        };
+
+        match async_std::future::timeout(Duration::from_secs(2), wait_until_pid_stops_existing)
+            .await
+        {
+            Ok(r) => r.map_err(QemuError::Shell),
+            Err(_) => {
+                let killed =
+                    shell::run_command_without_output("kill", vec!["-9", &pid.to_string()])
+                        .await
+                        .map_err(QemuError::Shell)?;
+                if killed {
+                    Ok(())
+                } else {
+                    Err(QemuError::CouldNotKill("kill failed"))
+                }
+            }
+        }
+    }
+    async fn get_pid(&self) -> Result<usize> {
+        let pid_file_path = self
+            .lc
+            .as_ref()
+            .expect("qemu handle in invalid state")
+            .temp_dir
+            .path()
+            .join("pidfile");
+
+        let mut buf = vec![0; 64];
+        let read_len = match async_std::fs::File::open(pid_file_path).await {
+            Ok(mut f) => f
+                .read(&mut buf)
+                .await
+                .map_err(|e| QemuError::IO(e, "reading pidfile"))?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(QemuError::NotRunning());
+            }
+            Err(e) => {
+                return Err(QemuError::IO(e, "opening pidfile"));
+            }
+        };
+
+        assert!(read_len > 0);
+        let pid_slice = from_utf8(&buf[0..read_len - 1]).map_err(QemuError::PidFileNonUtf)?;
+        pid_slice
+            .parse::<usize>()
+            .map_err(QemuError::PidFileNonNumeric)
+    }
+    // Test if the pid file exists
+    async fn is_running(&self) -> Result<bool> {
+        match self.get_pid().await {
+            Ok(pid) => run_command_without_output("ps", vec!["-p", &pid.to_string()])
+                .await
+                .map_err(QemuError::Shell),
+            Err(QemuError::NotRunning()) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl<'nc> Display for QemuProcessHandle<'nc> {
@@ -383,7 +427,9 @@ impl<'nc> Display for QemuProcessHandle<'nc> {
 
 impl<'nc> Drop for QemuProcessHandle<'nc> {
     fn drop(&mut self) {
-        task::block_on(stop_qemu(self.lc.take().unwrap()))
+        if self.lc.is_some() {
+            task::block_on(self.stop());
+        }
     }
 }
 
@@ -393,6 +439,16 @@ type Result<T> = core::result::Result<T, QemuError>;
 pub enum QemuError {
     #[error("When spawning qemu command")]
     Shell(#[source] shell::ShellError),
+    #[error("Qemu process is not running (pid file does not exist)")]
+    NotRunning(),
+    #[error("IO Error when: {1}")]
+    IO(#[source] async_std::io::Error, &'static str),
+    #[error("Pidfile does not containe vaild UTF-8")]
+    PidFileNonUtf(#[source] std::str::Utf8Error),
+    #[error("Pidfile does not contain a valid pid")]
+    PidFileNonNumeric(#[source] std::num::ParseIntError),
+    #[error("Could not kill qemu process")]
+    CouldNotKill(&'static str),
 }
 
 #[derive(Error, Debug)]

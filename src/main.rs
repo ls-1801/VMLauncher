@@ -1,4 +1,5 @@
 use async_std::future::timeout;
+use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -6,10 +7,11 @@ use std::time::Duration;
 
 use crate::nes::{Source, WorkerQueryProcessingConfigurationBuilder};
 use async_std::task;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8PathBuf};
 use clap::Parser;
 use inquire::{CustomType, InquireError};
 use ipnet::Ipv4Net;
+use itertools::Itertools;
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -79,6 +81,56 @@ fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
     })
 }
 
+struct ProcessOption<'a, 'b: 'a> {
+    index: usize,
+    qph: &'a mut QemuProcessHandle<'b>,
+}
+
+impl Display for ProcessOption<'_, '_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.qph))
+    }
+}
+
+fn run_stop<'a>(
+    instances: &mut Vec<QemuProcessHandle<'a>>,
+) -> Result<Vec<QemuProcessHandle<'a>>, (Vec<QemuProcessHandle<'a>>, Error)> {
+    let options = instances
+        .iter_mut()
+        .enumerate()
+        .map(|(i, o)| ProcessOption { index: i, qph: o })
+        .collect();
+
+    let options = inquire::MultiSelect::new("Stop machines?", options)
+        .prompt()
+        .map_err(|e| (vec![], Error::Inquire(e)))?;
+
+    let mut indexes_to_remove = vec![];
+    let mut first_error: Option<Error> = None;
+    for option in options {
+        match task::block_on(option.qph.stop()).map_err(Error::Qemu) {
+            Ok(_) => {
+                indexes_to_remove.push(option.index);
+            }
+            Err(e) => {
+                first_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    let mut removed_instances = vec![];
+    for x in indexes_to_remove.into_iter().sorted().rev() {
+        removed_instances.push(instances.swap_remove(x));
+    }
+
+    if let Some(e) = first_error {
+        Err((removed_instances, e))
+    } else {
+        Ok(removed_instances)
+    }
+}
+
 fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
     let worker_id = inquire::CustomType::<usize>::new("WorkerId?")
         .prompt()
@@ -145,8 +197,9 @@ fn main() {
     let bridges = futures_lite::future::block_on(network_setup(gateway_ip));
     {
         let mut qemu_instances = vec![];
+        let mut stoped_instances = vec![];
         loop {
-            let actions = vec!["stop", "add worker", "ps", "uk"];
+            let actions = vec!["stop", "add worker", "ps", "uk", "exit", "restart"];
             match inquire::Select::new("", actions).prompt() {
                 Err(inquire::InquireError::OperationCanceled) => continue,
                 Err(inquire::InquireError::OperationInterrupted) => break,
@@ -167,7 +220,25 @@ fn main() {
                             println!("{qh}")
                         }
                     }
-                    "stop" => {
+                    "restart" => match run_restart(&mut stoped_instances).as_mut() {
+                        Ok(started) => {
+                            qemu_instances.append(started);
+                        }
+                        Err((started, err)) => {
+                            qemu_instances.append(started);
+                            error!(%err, "Could not start all instances")
+                        }
+                    },
+                    "stop" => match run_stop(&mut qemu_instances).as_mut() {
+                        Ok(removed) => {
+                            stoped_instances.append(removed);
+                        }
+                        Err((removed, err)) => {
+                            stoped_instances.append(removed);
+                            error!(%err, "Could not remove all instances")
+                        }
+                    },
+                    "exit" => {
                         break;
                     }
                     "add worker" => match add_worker(&bridges) {
@@ -185,4 +256,43 @@ fn main() {
     }
 
     task::block_on(network_cleanup(bridges));
+}
+
+fn run_restart<'a>(
+    stopped_instances: &mut Vec<QemuProcessHandle<'a>>,
+) -> Result<Vec<QemuProcessHandle<'a>>, (Vec<QemuProcessHandle<'a>>, Error)> {
+    let options = stopped_instances
+        .iter_mut()
+        .enumerate()
+        .map(|(i, o)| ProcessOption { index: i, qph: o })
+        .collect();
+
+    let options = inquire::MultiSelect::new("Restart machines?", options)
+        .prompt()
+        .map_err(|e| (vec![], Error::Inquire(e)))?;
+
+    let mut indexes_to_remove = vec![];
+    let mut first_error: Option<Error> = None;
+    for option in options {
+        match task::block_on(option.qph.restart()).map_err(Error::Qemu) {
+            Ok(_) => {
+                indexes_to_remove.push(option.index);
+            }
+            Err(e) => {
+                first_error = Some(e);
+                break;
+            }
+        }
+    }
+
+    let mut removed_instances = vec![];
+    for x in indexes_to_remove.into_iter().sorted().rev() {
+        removed_instances.push(stopped_instances.swap_remove(x));
+    }
+
+    if let Some(e) = first_error {
+        Err((removed_instances, e))
+    } else {
+        Ok(removed_instances)
+    }
 }
