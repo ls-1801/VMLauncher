@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::nes::{Source, WorkerQueryProcessingConfigurationBuilder};
+use crate::nes::{
+    Format, Source, TCPSourceConfig, TCPSourceConfigBuilder,
+    WorkerQueryProcessingConfigurationBuilder,
+};
 use async_std::task;
-use camino::{Utf8PathBuf};
+use camino::Utf8PathBuf;
 use clap::Parser;
 use inquire::{CustomType, InquireError};
 use ipnet::Ipv4Net;
@@ -69,9 +72,17 @@ fn add_unikernel(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
 
     task::block_on(async move {
         let tap = nc.get_tap().await;
-        let lc = nanos::prepare_launch(wc, tap, &nanos::Args {})
-            .await
-            .map_err(Error::Nanos)?;
+        let lc = nanos::prepare_launch(
+            wc,
+            tap,
+            &nanos::Args {
+                klib_dir: "/home/ls/dima/nanos/output/klib/bin".to_string(),
+                kernel: "/home/ls/dima/nanos/output/platform/pc/bin/kernel.img".to_string(),
+                klibs: vec!["shmem".to_string(), "tmpfs".to_string()],
+            },
+        )
+        .await
+        .map_err(Error::Nanos)?;
         let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
         match timeout(Duration::from_secs(10), serial(&handle)).await {
             Err(_) => Ok(handle),
@@ -136,22 +147,26 @@ fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
         .prompt()
         .map_err(Error::Inquire)?;
 
+    let number_of_worker_threads = inquire::CustomType::<usize>::new("Number of Worker Threads?")
+        .prompt()
+        .map_err(Error::Inquire)?;
+
     let tap = task::block_on(nc.get_tap());
     let worker_config = WorkerConfiguration {
         host_ip_addr: IpAddr::from(nc.host_ip()),
         ip_addr: IpAddr::from(*tap.ip()),
         worker_id,
         parent_id: worker_id - 1,
-        sources: vec![Source::tcp_source(
-            "nexmark_bid".to_string(),
-            format!("nexmark_bid_{}", worker_id),
-            IpAddr::from([10, 0, 0, 1]),
-            8080,
-            std::time::Duration::from_millis(100),
-        )],
+        sources: vec![TCPSourceConfigBuilder::default()
+            .format(Format::NES(8))
+            .socket_port(8080)
+            .logical_source_name("bid".to_string())
+            .build()
+            .unwrap()
+            .into()],
         log_level: "LOG_INFO",
         query_processing: WorkerQueryProcessingConfigurationBuilder::default()
-            .number_of_worker_threads(8)
+            .number_of_worker_threads(number_of_worker_threads)
             .buffer_size(8192)
             .number_of_source_buffers(128)
             .total_number_of_buffers(4096)
@@ -164,6 +179,7 @@ fn add_worker(nc: &NetworkConfig) -> Result<QemuProcessHandle, Error> {
         let wc = worker_config;
         let args = flatcar::Args {
             flatcar_fresh_image: PathBuf::from("./flatcar_fresh.iso"),
+            number_of_cores: Some(number_of_worker_threads * 2),
         };
         let lc = flatcar::prepare_launch(wc, tap, &args).await;
         qemu::start_qemu(lc).await.map_err(Error::Qemu)
