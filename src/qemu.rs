@@ -26,6 +26,8 @@ pub struct LaunchConfiguration<'nc> {
     pub(crate) image_path: PathBuf,
     pub(crate) temp_dir: TempDir,
     pub(crate) firmware: Vec<QemuFirmwareConfig>,
+    pub(crate) num_cores: Option<usize>,
+    pub(crate) memory_in_mega_bytes: Option<usize>,
 }
 
 const QEMU_BINARY: &str = "qemu-system-x86_64";
@@ -277,8 +279,8 @@ fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
 
     let qc = QemuConfig {
         name: None,
-        memory_in_megabytes: Some(16000),
-        number_of_cores: Some(8),
+        memory_in_megabytes: Some(lc.memory_in_mega_bytes.unwrap_or(16000)),
+        number_of_cores: Some(lc.num_cores.unwrap_or(8)),
         rng_device: true,
         tap: Some(&lc.tap),
         firmware: lc.firmware.clone(),
@@ -474,7 +476,6 @@ pub async fn serial<'nc>(handle: &QemuProcessHandle<'nc>) -> core::result::Resul
 
     let mut buf = vec![0u8; 1000];
     loop {
-        dbg!("loop");
         let result = io::timeout(Duration::from_secs(1), connection.read(&mut buf)).await;
 
         let result = match result {

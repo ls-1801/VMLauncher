@@ -61,6 +61,7 @@ async fn run_butane(config: &FlatcarConfig) -> String {
 #[derive(Clone)]
 pub struct Args {
     pub flatcar_fresh_image: PathBuf,
+    pub number_of_cores: Option<usize>,
 }
 
 fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
@@ -126,6 +127,8 @@ pub(crate) async fn prepare_launch<'nc>(
             name: "opt/org.flatcar-linux/config".to_string(),
             path: temp_dir.path().join("ignition.json"),
         }],
+        num_cores: args.number_of_cores,
+        memory_in_mega_bytes: None,
         temp_dir,
     }
 }
