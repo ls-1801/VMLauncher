@@ -1,4 +1,7 @@
 use camino::Utf8PathBuf;
+use serde::Serialize;
+use std::fs;
+use std::io::Write;
 use thiserror::Error;
 
 use crate::network::TapUser;
@@ -6,8 +9,13 @@ use crate::qemu::LaunchConfiguration;
 use crate::shell;
 use crate::shell::ShellError;
 
-#[derive(Debug)]
-pub struct Args {}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Args {
+    pub(crate) klibs: Vec<String>,
+    pub(crate) kernel: String,
+    pub(crate) klib_dir: String,
+}
 
 #[derive(Debug)]
 pub struct UnikernelWorkerConfig {
@@ -19,7 +27,7 @@ pub struct UnikernelWorkerConfig {
 
 impl UnikernelWorkerConfig {
     fn image_name(&self) -> String {
-        format!("unikernel_{}_{}.img", self.query_id, self.node_id)
+        format!("unikernel_{}_{}", self.query_id, self.node_id)
     }
 }
 
@@ -27,8 +35,8 @@ impl UnikernelWorkerConfig {
 pub(crate) enum NanosError {
     #[error("Failed to run shell command")]
     Shell(#[source] ShellError),
-    #[error("FileSystem error")]
-    FileSystem(#[source] std::io::Error),
+    #[error("FileSystem error: {1}")]
+    FileSystem(#[source] std::io::Error, &'static str),
     #[error("Homedir error")]
     HomeDir(#[source] homedir::GetHomeError),
 }
@@ -40,14 +48,26 @@ pub(crate) async fn prepare_launch<'nc>(
     args: &Args,
 ) -> Result<LaunchConfiguration<'nc>, NanosError> {
     let image_name = worker_configuration.image_name();
-    let temp_dir = tempdir::TempDir::new(&image_name).map_err(NanosError::FileSystem)?;
+    let temp_dir = tempdir::TempDir::new(&image_name)
+        .map_err(|e| NanosError::FileSystem(e, "Creating Tempdir"))?;
     let dest_image_path = temp_dir.path().join(&image_name);
     let ip_string = tap.ip().to_string();
+    let nanos_config_file = temp_dir.path().join("nanos_config.json");
+
+    let mut file = fs::File::create(&nanos_config_file)
+        .map_err(|e| NanosError::FileSystem(e, "Creating Config"))?;
+    serde_json::to_string(args).unwrap();
+
+    file.write_all(serde_json::to_string(args).unwrap().as_bytes())
+        .map_err(|e| NanosError::FileSystem(e, "Writing Config"))?;
+
     let mut ops_args = vec![
         "build".to_string(),
         worker_configuration.elf_binary.to_string(),
         "--ip-address".to_string(),
         ip_string,
+        "-c".to_string(),
+        nanos_config_file.to_str().as_ref().unwrap().to_string(),
         "-i".to_string(),
         image_name.clone(),
     ];
@@ -71,12 +91,14 @@ pub(crate) async fn prepare_launch<'nc>(
         .join(&image_name);
     async_std::fs::copy(&path_to_image, &dest_image_path)
         .await
-        .map_err(NanosError::FileSystem)?;
+        .map_err(|e| NanosError::FileSystem(e, "Copy Image"))?;
 
     Ok(LaunchConfiguration {
         tap,
         image_path: dest_image_path,
         temp_dir,
         firmware: vec![],
+        num_cores: Some(1),
+        memory_in_mega_bytes: Some(1024),
     })
 }
