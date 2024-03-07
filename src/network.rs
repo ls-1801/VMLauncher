@@ -57,6 +57,7 @@ impl Bridge {
             let ip_show_output = run_ip_command("a", vec!["show", name])
                 .await
                 .expect("could not fetch further info about net device");
+
             let ip = Self::parse_ip_show_output(&ip_show_output);
             bridges.push(Bridge {
                 name: name.to_string(),
@@ -89,7 +90,8 @@ impl Bridge {
                 return existing_bridge;
             } else {
                 warn!(name = new_bridge.name, ip_net = %new_bridge.ip_addr, other_ip = %existing_bridge.ip_addr, "Bridge already exists! Deleting old");
-                Self::destroy(existing_bridge).await;
+                return existing_bridge;
+                // Self::destroy(existing_bridge).await;
             }
         }
 
@@ -170,7 +172,7 @@ impl Tap {
     }
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = tracing::Level::DEBUG)]
 async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/ip",
@@ -179,7 +181,7 @@ async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, ShellE
     .await
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = tracing::Level::DEBUG)]
 async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/sbin/brctl",
