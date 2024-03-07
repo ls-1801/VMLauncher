@@ -57,7 +57,7 @@ pub fn stderr_as_str(output: &Output) -> Result<&str> {
         .map_err(|e| ShellError::new(ShellErrorEnum::InvalidUTF8Output(e)))
 }
 
-#[tracing::instrument(skip(data))]
+#[tracing::instrument(skip(data), err(level = tracing::Level::INFO))]
 pub async fn run_shell_command_with_stdin(
     command: &str,
     args: Vec<&str>,
@@ -108,7 +108,7 @@ pub async fn run_shell_command_with_stdin(
     return Ok(stdout.to_string());
 }
 
-#[tracing::instrument]
+#[tracing::instrument(err(level = tracing::Level::INFO))]
 pub async fn run_shell_command(command: &str, args: Vec<&str>) -> Result<String> {
     println!("{command} {}", args.join(" "));
     let mut child = Command::new(
@@ -123,10 +123,22 @@ pub async fn run_shell_command(command: &str, args: Vec<&str>) -> Result<String>
         .status()
         .await
         .map_err(|e| ShellError::new(ShellErrorEnum::IOFailed(e)))?;
+
     let output = child
         .output()
         .await
         .map_err(|e| ShellError::new(ShellErrorEnum::IOFailed(e)))?;
+
+    if !exit_status.success() {
+        error!(
+            status = ?exit_status.code(),
+            error = stderr_as_str(&output)?,
+            "Unexpected Exit status"
+        );
+        return Err(ShellError::new(ShellErrorEnum::UnexpectedExitCode(
+            exit_status,
+        )));
+    }
 
     let stdout = stdout_as_str(&output)?;
     info!(output = stdout, "done");
