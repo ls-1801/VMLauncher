@@ -317,7 +317,7 @@ impl<'nc> QemuProcessHandle<'nc> {
             .path()
             .join("monitor.socket")
     }
-    fn serial_path(&self) -> PathBuf {
+    pub fn serial_path(&self) -> PathBuf {
         self.lc
             .as_ref()
             .expect("invalid state")
@@ -435,6 +435,34 @@ impl<'nc> Drop for QemuProcessHandle<'nc> {
     }
 }
 
+pub async fn serial(serial_socket: PathBuf) -> core::result::Result<(), SerialError> {
+    let connection = io::timeout(
+        Duration::from_secs(1),
+        UnixStream::connect(serial_socket),
+    )
+    .await;
+    let mut connection = connection.map_err(SerialError::Connecting)?;
+
+    let mut buf = vec![0u8; 1000];
+    loop {
+        let result = io::timeout(Duration::from_secs(1), connection.read(&mut buf)).await;
+
+        let result = match result {
+            Err(e) => {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    continue;
+                } else {
+                    return Err(SerialError::Reading(e));
+                }
+            }
+            Ok(r) => r,
+        };
+
+        let output = from_utf8(&buf[0..result]).map_err(SerialError::UTF8)?;
+        print!("{}", output);
+    }
+}
+
 type Result<T> = core::result::Result<T, QemuError>;
 
 #[derive(Error, Debug)]
@@ -461,37 +489,6 @@ pub enum SerialError {
     Reading(#[source] std::io::Error),
     #[error("While reading utf8")]
     UTF8(#[source] std::str::Utf8Error),
-}
-
-pub async fn serial<'nc>(handle: &QemuProcessHandle<'nc>) -> core::result::Result<(), SerialError> {
-    let serial_socket = handle
-        .lc
-        .as_ref()
-        .unwrap()
-        .temp_dir
-        .path()
-        .join("serial.socket");
-    let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
-    let mut connection = connection.map_err(SerialError::Connecting)?;
-
-    let mut buf = vec![0u8; 1000];
-    loop {
-        let result = io::timeout(Duration::from_secs(1), connection.read(&mut buf)).await;
-
-        let result = match result {
-            Err(e) => {
-                if e.kind() == io::ErrorKind::TimedOut {
-                    continue;
-                } else {
-                    return Err(SerialError::Reading(e));
-                }
-            }
-            Ok(r) => r,
-        };
-
-        let output = from_utf8(&buf[0..result]).map_err(SerialError::UTF8)?;
-        print!("{}", output);
-    }
 }
 
 #[instrument]
