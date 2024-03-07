@@ -15,6 +15,7 @@ pub struct Args {
     pub(crate) klibs: Vec<String>,
     pub(crate) kernel: String,
     pub(crate) klib_dir: String,
+    pub(crate) debugflags: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -79,16 +80,19 @@ pub(crate) async fn prepare_launch<'nc>(
         }
     }
 
-    let refs = ops_args.iter().map(|s| s.as_str()).collect();
-    shell::run_shell_command("ops", refs)
-        .await
-        .map_err(NanosError::Shell)?;
-
     let path_to_image = homedir::get_my_home()
         .map_err(NanosError::HomeDir)?
         .expect("Could not locate Home Directory")
         .join(".ops/images")
         .join(&image_name);
+
+    let _ = fs::remove_file(&path_to_image);
+
+    let refs = ops_args.iter().map(|s| s.as_str()).collect();
+    shell::run_shell_command("ops", refs)
+        .await
+        .map_err(NanosError::Shell)?;
+
     async_std::fs::copy(&path_to_image, &dest_image_path)
         .await
         .map_err(|e| NanosError::FileSystem(e, "Copy Image"))?;
