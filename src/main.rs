@@ -2,7 +2,7 @@ use async_std::future::timeout;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::stdin;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -74,6 +74,8 @@ enum Error {
     QemuSerial(#[source] SerialError),
     #[error("Qemu Error while doing io")]
     IO(#[source] std::io::Error),
+    #[error("Could not open script file: {1}. Error: {0}")]
+    ScriptFileNotFound(#[source] std::io::Error, Utf8PathBuf),
     #[error("Qemu Error while doing io")]
     Deserialization(#[source] serde_yaml::Error),
 }
@@ -85,6 +87,7 @@ struct AddUnikernelArgs {
     query_id: usize,
     path_to_binary: String,
     args: Vec<String>,
+    ip: Option<Ipv4Addr>,
 }
 
 impl AddUnikernelArgs {
@@ -107,6 +110,7 @@ impl AddUnikernelArgs {
                 .split(' ')
                 .map(|s| s.to_string())
                 .collect(),
+            ip: inquire::CustomType::<Ipv4Addr>::new("ip ?").prompt_skippable()?,
         })
     }
 }
@@ -120,6 +124,7 @@ fn add_unikernel(
         query_id: args.query_id,
         elf_binary: Utf8PathBuf::from(args.path_to_binary),
         args: Some(args.args.join(" ")),
+        ip: args.ip,
     };
 
     task::block_on(async move {
@@ -138,14 +143,14 @@ fn add_unikernel(
         .map_err(Error::Nanos)?;
         let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
         let serial_socket = handle.serial_path();
-        return Ok((
+        Ok((
             handle,
             task::spawn(async move {
-                serial(serial_socket)
+                serial(serial_socket, args.node_id)
                     .await
                     .map_err(|e| Error::QemuSerial(e))
             }),
-        ));
+        ))
     })
 }
 
@@ -377,8 +382,8 @@ fn run_commands_stop_at_first_error<'nc>(
 }
 
 fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
-    let file: Box<dyn std::io::Read + 'static> = if let Some(path) = args.config {
-        Box::from(File::open(path).map_err(Error::IO)?)
+    let file: Box<dyn std::io::Read + 'static> = if let Some(ref path) = args.config {
+        Box::from(File::open(path).map_err(|e| Error::ScriptFileNotFound(e, path.clone()))?)
     } else {
         Box::from(stdin())
     };

@@ -1,0 +1,17 @@
+commands:
+  - type: AddUnikernel
+    nodeId: 2
+    queryId: 1
+    pathToBinary: /home/ls/dima/nes-test-queries/join-query/build/unikernel2.lto
+    args: [ ]
+  - type: AddUnikernel
+    nodeId: 3
+    queryId: 1
+    pathToBinary: /home/ls/dima/nes-test-queries/join-query/build/unikernel3.lto
+    args: [ ]
+  - type: AddUnikernel
+    nodeId: 4
+    queryId: 1
+    pathToBinary: /home/ls/dima/nes-test-queries/join-query/build/unikernel4.lto
+    args: [ ]
+

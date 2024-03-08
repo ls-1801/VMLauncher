@@ -435,17 +435,21 @@ impl<'nc> Drop for QemuProcessHandle<'nc> {
     }
 }
 
-pub async fn serial(serial_socket: PathBuf) -> core::result::Result<(), SerialError> {
-    let connection = io::timeout(
-        Duration::from_secs(1),
-        UnixStream::connect(serial_socket),
-    )
-    .await;
+pub async fn serial(
+    serial_socket: PathBuf,
+    nodeId: usize,
+) -> core::result::Result<(), SerialError> {
+    let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
     let mut connection = connection.map_err(SerialError::Connecting)?;
 
-    let mut buf = vec![0u8; 1000];
+    let mut buf = vec![0u8; 4096];
+    let mut current_index = 0;
     loop {
-        let result = io::timeout(Duration::from_secs(1), connection.read(&mut buf)).await;
+        let result = io::timeout(
+            Duration::from_secs(1),
+            connection.read(&mut buf[current_index..]),
+        )
+        .await;
 
         let result = match result {
             Err(e) => {
@@ -458,9 +462,90 @@ pub async fn serial(serial_socket: PathBuf) -> core::result::Result<(), SerialEr
             Ok(r) => r,
         };
 
-        let output = from_utf8(&buf[0..result]).map_err(SerialError::UTF8)?;
-        print!("{}", output);
+        (buf, current_index) = chunk_to_lines(buf, current_index + result, |line| {
+            println!("[{}] {}", nodeId, line);
+        })?;
     }
+}
+
+fn chunk_to_lines(
+    mut buf: Vec<u8>,
+    bytes_used: usize,
+    f: impl Fn(&str),
+) -> core::result::Result<(Vec<u8>, usize), SerialError> {
+    let mut current_index = bytes_used;
+    let output = from_utf8(&buf[0..bytes_used]).map_err(SerialError::UTF8)?;
+    match output.rfind('\n') {
+        None => {}
+        Some(size) => {
+            for x in output[..size].lines() {
+                f(x)
+            }
+            current_index = bytes_used - (size + 1);
+            buf.drain(0..size + 1);
+            buf.resize(4096, 0);
+        }
+    }
+
+    Ok((buf, current_index))
+}
+
+#[test]
+fn test_chunk_to_lines() {
+    let mut vec = vec![0u8; 4096];
+    let message = "Hello".as_bytes();
+    let messageWithNewline = "Hello\nHellow".as_bytes();
+    vec[..message.len()].clone_from_slice(message);
+
+    let (mut vec, current_index) = chunk_to_lines(vec, message.len(), |f| {
+        assert!(false, "No line was ever finished");
+    })
+    .unwrap();
+
+    assert_eq!(vec.len(), 4096);
+    assert_eq!(current_index, message.len());
+
+    vec[current_index..(current_index + message.len())].clone_from_slice(message);
+
+    let (mut vec, current_index) = chunk_to_lines(vec, current_index + message.len(), |f| {
+        assert!(false, "No line was ever finished");
+    })
+    .unwrap();
+
+    assert_eq!(vec.len(), 4096);
+    assert_eq!(current_index, message.len() * 2);
+
+    vec[current_index..(current_index + messageWithNewline.len())]
+        .clone_from_slice(messageWithNewline);
+
+    let (mut vec, current_index) = chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
+        assert_eq!(f, "HelloHelloHello");
+    }).unwrap();
+
+    assert_eq!(vec.len(), 4096);
+    assert_eq!(current_index, "Hellow".len());
+
+
+    vec[current_index..(current_index + message.len())].clone_from_slice(message);
+
+    let (mut vec, current_index) = chunk_to_lines(vec, current_index + message.len(), |f| {
+        assert!(false, "No line was ever finished");
+    })
+        .unwrap();
+
+    assert_eq!(vec.len(), 4096);
+    assert_eq!(current_index, "Hellow".len() + message.len());
+
+
+    vec[current_index..(current_index + messageWithNewline.len())]
+        .clone_from_slice(messageWithNewline);
+
+    let (mut vec, current_index) = chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
+        assert_eq!(f, "HellowHelloHello");
+    }).unwrap();
+
+    assert_eq!(vec.len(), 4096);
+    assert_eq!(current_index, "Hellow".len());
 }
 
 type Result<T> = core::result::Result<T, QemuError>;

@@ -57,7 +57,7 @@ pub fn stderr_as_str(output: &Output) -> Result<&str> {
         .map_err(|e| ShellError::new(ShellErrorEnum::InvalidUTF8Output(e)))
 }
 
-#[tracing::instrument(skip(data), err(level = tracing::Level::INFO))]
+#[tracing::instrument(skip(data), level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
 pub async fn run_shell_command_with_stdin(
     command: &str,
     args: Vec<&str>,
@@ -108,7 +108,7 @@ pub async fn run_shell_command_with_stdin(
     return Ok(stdout.to_string());
 }
 
-#[tracing::instrument(err(level = tracing::Level::INFO))]
+#[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
 pub async fn run_shell_command(command: &str, args: Vec<&str>) -> Result<String> {
     println!("{command} {}", args.join(" "));
     let mut child = Command::new(
@@ -146,9 +146,8 @@ pub async fn run_shell_command(command: &str, args: Vec<&str>) -> Result<String>
     return Ok(stdout.to_string());
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = tracing::Level::DEBUG)]
 pub async fn run_command_without_output(command: &str, args: Vec<&str>) -> Result<bool> {
-    println!("{command} {}", args.join(" "));
     let mut child = Command::new(
         which::which(command).map_err(|e| ShellError::new(ShellErrorEnum::BinaryNotFound(e)))?,
     )

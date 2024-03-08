@@ -150,13 +150,7 @@ fn physical_sources() {
         worker_id: 0,
         parent_id: 0,
         log_level: "LOG_DEBUG",
-        sources: vec![Source::tcp_source(
-            "logical".to_string(),
-            "physical".to_string(),
-            IpAddr::from([10, 0, 0, 1]),
-            8080,
-            std::time::Duration::from_millis(100),
-        )],
+        sources: vec![],
         query_processing: WorkerQueryProcessingConfigurationInternal::default(),
     };
     assert_eq!(

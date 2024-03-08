@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 
 use async_std::task;
 
@@ -44,7 +45,7 @@ impl Bridge {
     fn parse_ip_show_output(output: &str) -> Result<Ipv4Net, String> {
         let inet_line = output.lines().find(|l| l.trim().starts_with("inet"));
         let ip = inet_line.unwrap().split_whitespace().nth(1);
-        Ok(str::parse(ip.unwrap()).unwrap())
+        Ok(str::parse(ip.unwrap()).unwrap_or(Ipv4Net::from_str("10.0.0.1/24").unwrap()))
     }
     async fn find_all() -> Result<Vec<Bridge>, ShellError> {
         let output = run_brctl_command("show", vec![]).await?;
