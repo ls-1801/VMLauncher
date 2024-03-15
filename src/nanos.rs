@@ -14,8 +14,10 @@ use crate::shell::ShellError;
 #[serde(rename_all = "PascalCase")]
 pub struct Args {
     pub(crate) klibs: Vec<String>,
-    pub(crate) kernel: String,
-    pub(crate) klib_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kernel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) klib_dir: Option<String>,
     pub(crate) debugflags: Vec<String>,
 }
 
@@ -25,7 +27,7 @@ pub struct UnikernelWorkerConfig {
     pub node_id: usize,
     pub elf_binary: Utf8PathBuf,
     pub args: Option<String>,
-    pub ip: Option<Ipv4Addr>
+    pub ip: Option<Ipv4Addr>,
 }
 
 impl UnikernelWorkerConfig {
@@ -54,7 +56,11 @@ pub(crate) async fn prepare_launch<'nc>(
     let temp_dir = tempdir::TempDir::new(&image_name)
         .map_err(|e| NanosError::FileSystem(e, "Creating Tempdir"))?;
     let dest_image_path = temp_dir.path().join(&image_name);
-    let ip_string = worker_configuration.ip.as_ref().unwrap_or(tap.ip()).to_string();
+    let ip_string = worker_configuration
+        .ip
+        .as_ref()
+        .unwrap_or(tap.ip())
+        .to_string();
     let nanos_config_file = temp_dir.path().join("nanos_config.json");
 
     let mut file = fs::File::create(&nanos_config_file)

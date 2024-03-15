@@ -25,7 +25,6 @@ use tracing::{error, info};
 use crate::network::{network_cleanup, network_setup, NetworkConfig};
 use crate::qemu::{serial, start_qemu, QemuError, QemuProcessHandle, SerialError};
 use crate::templates::WorkerConfiguration;
-use crate::ScriptCommands::AddUnikernel;
 
 mod flatcar;
 mod nanos;
@@ -39,6 +38,8 @@ mod templates;
 struct ProgramArgs {
     #[arg(short = 'k')]
     keep_bridge_alive: bool,
+    #[arg(long)]
+    nanos_src_dir: Option<Utf8PathBuf>,
     #[clap(subcommand)]
     command: VMLauncherCommand,
 }
@@ -115,10 +116,11 @@ impl AddUnikernelArgs {
     }
 }
 
-fn add_unikernel(
-    nc: &NetworkConfig,
+fn add_unikernel<'a>(
+    nc: &'a NetworkConfig,
     args: AddUnikernelArgs,
-) -> Result<(QemuProcessHandle, JoinHandle<Result<(), Error>>), Error> {
+    nanos_dir: &Option<Utf8PathBuf>,
+) -> Result<(QemuProcessHandle<'a>, JoinHandle<Result<(), Error>>), Error> {
     let wc = nanos::UnikernelWorkerConfig {
         node_id: args.node_id,
         query_id: args.query_id,
@@ -133,8 +135,12 @@ fn add_unikernel(
             wc,
             tap,
             &nanos::Args {
-                klib_dir: "/home/ls/dima/nanos/output/klib/bin".to_string(),
-                kernel: "/home/ls/dima/nanos/output/platform/pc/bin/kernel.img".to_string(),
+                klib_dir: nanos_dir
+                    .as_ref()
+                    .map(|path| path.join("/output/klib/bin").to_string()),
+                kernel: nanos_dir
+                    .as_ref()
+                    .map(|path| path.join("/output/platform/pc/bin/kernel.img").to_string()),
                 klibs: vec!["shmem".to_string(), "tmpfs".to_string()],
                 debugflags: vec![],
             },
@@ -232,7 +238,7 @@ fn add_worker(nc: &NetworkConfig, args: AddWorkerArgs) -> Result<QemuProcessHand
         parent_id: args.worker_id - 1,
         sources: vec![TCPSourceConfigBuilder::default()
             .format(Format::NES(8))
-            .socket_port(8080)
+            .socket_port(8091)
             .logical_source_name("bid".to_string())
             .build()
             .unwrap()
@@ -259,7 +265,11 @@ fn add_worker(nc: &NetworkConfig, args: AddWorkerArgs) -> Result<QemuProcessHand
     })
 }
 
-fn interactive_main(args: InteractiveArgs, keep_bridge_alive: bool) -> Result<(), Error> {
+fn interactive_main(
+    args: InteractiveArgs,
+    keep_bridge_alive: bool,
+    nanos_dir: Option<Utf8PathBuf>,
+) -> Result<(), Error> {
     let gateway_ip = args
         .ip_range
         .or_else(|| {
@@ -288,7 +298,7 @@ fn interactive_main(args: InteractiveArgs, keep_bridge_alive: bool) -> Result<()
                 Ok(action) => match action {
                     "uk" => match AddUnikernelArgs::inquire()
                         .map_err(Error::Inquire)
-                        .and_then(|args| add_unikernel(&bridges, args))
+                        .and_then(|args| add_unikernel(&bridges, args, &nanos_dir))
                     {
                         Ok((qh, serial)) => {
                             qemu_instances.push(qh);
@@ -364,6 +374,7 @@ fn run_commands_stop_at_first_error<'nc>(
     qemu_instances: &mut Vec<QemuProcessHandle<'nc>>,
     serials: &mut Vec<JoinHandle<Result<(), Error>>>,
     commands: Vec<ScriptCommands>,
+    nanos_dir: Option<Utf8PathBuf>,
 ) -> Result<(), Error> {
     for command in commands {
         match command {
@@ -371,7 +382,7 @@ fn run_commands_stop_at_first_error<'nc>(
                 qemu_instances.push(add_worker(&bridges, args)?);
             }
             ScriptCommands::AddUnikernel(args) => {
-                let (qh, serial) = add_unikernel(&bridges, args)?;
+                let (qh, serial) = add_unikernel(&bridges, args, &nanos_dir)?;
                 qemu_instances.push(qh);
                 serials.push(serial);
             }
@@ -381,7 +392,11 @@ fn run_commands_stop_at_first_error<'nc>(
     Ok(())
 }
 
-fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
+fn script_main(
+    args: ScriptArgs,
+    keep_bridge_alive: bool,
+    nanos_dir: Option<Utf8PathBuf>,
+) -> Result<(), Error> {
     let file: Box<dyn std::io::Read + 'static> = if let Some(ref path) = args.config {
         Box::from(File::open(path).map_err(|e| Error::ScriptFileNotFound(e, path.clone()))?)
     } else {
@@ -410,6 +425,7 @@ fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
             &mut qemu_instances,
             &mut serials,
             script.commands,
+            nanos_dir,
         )
         .is_ok()
         {
@@ -436,10 +452,11 @@ fn main() {
 
     match args.command {
         VMLauncherCommand::Interactive(ia) => {
-            interactive_main(ia, args.keep_bridge_alive).expect("Interactive Failed")
+            interactive_main(ia, args.keep_bridge_alive, args.nanos_src_dir)
+                .expect("Interactive Failed")
         }
         VMLauncherCommand::Script(sa) => {
-            script_main(sa, args.keep_bridge_alive).expect("Script Failed")
+            script_main(sa, args.keep_bridge_alive, args.nanos_src_dir).expect("Script Failed")
         }
     };
 }
