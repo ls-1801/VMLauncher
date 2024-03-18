@@ -435,13 +435,23 @@ impl<'nc> Drop for QemuProcessHandle<'nc> {
     }
 }
 
-pub async fn serial(
+pub async fn serial_with_command(
+    command: &str,
     serial_socket: PathBuf,
-    nodeId: usize,
+    node_id: usize,
 ) -> core::result::Result<(), SerialError> {
     let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
     let mut connection = connection.map_err(SerialError::Connecting)?;
 
+    connection.write_all(command.as_bytes()).await.map_err(SerialError::Writing)?;
+
+    serial_listen(connection, node_id).await
+}
+
+async fn serial_listen(
+    mut connection: UnixStream,
+    node_id: usize,
+) -> core::result::Result<(), SerialError> {
     let mut buf = vec![0u8; 4096];
     let mut current_index = 0;
     loop {
@@ -463,9 +473,18 @@ pub async fn serial(
         };
 
         (buf, current_index) = chunk_to_lines(buf, current_index + result, |line| {
-            println!("[{}] {}", nodeId, line);
+            println!("[{}] {}", node_id, line);
         })?;
     }
+}
+
+pub async fn serial(
+    serial_socket: PathBuf,
+    node_id: usize,
+) -> core::result::Result<(), SerialError> {
+    let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
+    let mut connection = connection.map_err(SerialError::Connecting)?;
+    serial_listen(connection, node_id).await
 }
 
 fn chunk_to_lines(
@@ -518,31 +537,33 @@ fn test_chunk_to_lines() {
     vec[current_index..(current_index + messageWithNewline.len())]
         .clone_from_slice(messageWithNewline);
 
-    let (mut vec, current_index) = chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
-        assert_eq!(f, "HelloHelloHello");
-    }).unwrap();
+    let (mut vec, current_index) =
+        chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
+            assert_eq!(f, "HelloHelloHello");
+        })
+        .unwrap();
 
     assert_eq!(vec.len(), 4096);
     assert_eq!(current_index, "Hellow".len());
-
 
     vec[current_index..(current_index + message.len())].clone_from_slice(message);
 
     let (mut vec, current_index) = chunk_to_lines(vec, current_index + message.len(), |f| {
         assert!(false, "No line was ever finished");
     })
-        .unwrap();
+    .unwrap();
 
     assert_eq!(vec.len(), 4096);
     assert_eq!(current_index, "Hellow".len() + message.len());
 
-
     vec[current_index..(current_index + messageWithNewline.len())]
         .clone_from_slice(messageWithNewline);
 
-    let (mut vec, current_index) = chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
-        assert_eq!(f, "HellowHelloHello");
-    }).unwrap();
+    let (mut vec, current_index) =
+        chunk_to_lines(vec, current_index + messageWithNewline.len(), |f| {
+            assert_eq!(f, "HellowHelloHello");
+        })
+        .unwrap();
 
     assert_eq!(vec.len(), 4096);
     assert_eq!(current_index, "Hellow".len());
@@ -570,6 +591,8 @@ pub enum QemuError {
 pub enum SerialError {
     #[error("While connecting")]
     Connecting(#[source] std::io::Error),
+    #[error("While writing")]
+    Writing(#[source] std::io::Error),
     #[error("While reading")]
     Reading(#[source] std::io::Error),
     #[error("While reading utf8")]
@@ -580,7 +603,7 @@ pub enum SerialError {
 pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> Result<QemuProcessHandle<'nc>> {
     run_shell_command(
         QEMU_BINARY,
-        create_qemu_arguments(&lc)
+        &create_qemu_arguments(&lc)
             .iter()
             .map(|s| s.as_ref())
             .collect(),

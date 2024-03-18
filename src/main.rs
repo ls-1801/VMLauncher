@@ -23,7 +23,7 @@ use thiserror::Error;
 use tracing::{error, info};
 
 use crate::network::{network_cleanup, network_setup, NetworkConfig};
-use crate::qemu::{serial, start_qemu, QemuError, QemuProcessHandle, SerialError};
+use crate::qemu::{serial, start_qemu, QemuError, QemuProcessHandle, SerialError, serial_with_command};
 use crate::templates::WorkerConfiguration;
 
 mod flatcar;
@@ -38,8 +38,6 @@ mod templates;
 struct ProgramArgs {
     #[arg(short = 'k')]
     keep_bridge_alive: bool,
-    #[arg(long)]
-    nanos_src_dir: Option<Utf8PathBuf>,
     #[clap(subcommand)]
     command: VMLauncherCommand,
 }
@@ -119,7 +117,6 @@ impl AddUnikernelArgs {
 fn add_unikernel<'a>(
     nc: &'a NetworkConfig,
     args: AddUnikernelArgs,
-    nanos_dir: &Option<Utf8PathBuf>,
 ) -> Result<(QemuProcessHandle<'a>, JoinHandle<Result<(), Error>>), Error> {
     let wc = nanos::UnikernelWorkerConfig {
         node_id: args.node_id,
@@ -135,18 +132,14 @@ fn add_unikernel<'a>(
             wc,
             tap,
             &nanos::Args {
-                klib_dir: nanos_dir
-                    .as_ref()
-                    .map(|path| path.join("/output/klib/bin").to_string()),
-                kernel: nanos_dir
-                    .as_ref()
-                    .map(|path| path.join("/output/platform/pc/bin/kernel.img").to_string()),
+                klib_dir: None,
+                kernel: None,
                 klibs: vec!["shmem".to_string(), "tmpfs".to_string()],
                 debugflags: vec![],
             },
         )
-        .await
-        .map_err(Error::Nanos)?;
+            .await
+            .map_err(Error::Nanos)?;
         let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
         let serial_socket = handle.serial_path();
         Ok((
@@ -229,8 +222,9 @@ impl AddWorkerArgs {
     }
 }
 
-fn add_worker(nc: &NetworkConfig, args: AddWorkerArgs) -> Result<QemuProcessHandle, Error> {
+fn add_worker<'a>(nc: &'a NetworkConfig, args: AddWorkerArgs) -> Result<(QemuProcessHandle<'a>, JoinHandle<Result<(), Error>>), Error> {
     let tap = task::block_on(nc.get_tap());
+    let worker_id = args.worker_id;
     let worker_config = WorkerConfiguration {
         host_ip_addr: IpAddr::from(nc.host_ip()),
         ip_addr: IpAddr::from(*tap.ip()),
@@ -258,17 +252,26 @@ fn add_worker(nc: &NetworkConfig, args: AddWorkerArgs) -> Result<QemuProcessHand
         let wc = worker_config;
         let args = flatcar::Args {
             flatcar_fresh_image: PathBuf::from("./flatcar_fresh.iso"),
-            number_of_cores: Some(args.number_of_worker_threads * 2),
+            number_of_cores: Some(args.number_of_worker_threads),
         };
         let lc = flatcar::prepare_launch(wc, tap, &args).await;
-        qemu::start_qemu(lc).await.map_err(Error::Qemu)
+        let handle = qemu::start_qemu(lc).await.map_err(Error::Qemu)?;
+        let serial_socket = handle.serial_path();
+        Ok((
+            handle,
+            task::spawn(async move {
+                task::sleep(Duration::from_secs(20)).await;
+                serial_with_command("journalctl -u nesWorker -f\n", serial_socket, worker_id)
+                    .await
+                    .map_err(|e| Error::QemuSerial(e))
+            }),
+        ))
     })
 }
 
 fn interactive_main(
     args: InteractiveArgs,
     keep_bridge_alive: bool,
-    nanos_dir: Option<Utf8PathBuf>,
 ) -> Result<(), Error> {
     let gateway_ip = args
         .ip_range
@@ -298,7 +301,7 @@ fn interactive_main(
                 Ok(action) => match action {
                     "uk" => match AddUnikernelArgs::inquire()
                         .map_err(Error::Inquire)
-                        .and_then(|args| add_unikernel(&bridges, args, &nanos_dir))
+                        .and_then(|args| add_unikernel(&bridges, args))
                     {
                         Ok((qh, serial)) => {
                             qemu_instances.push(qh);
@@ -338,7 +341,10 @@ fn interactive_main(
                         .map_err(Error::Inquire)
                         .and_then(|args| add_worker(&bridges, args))
                     {
-                        Ok(qh) => qemu_instances.push(qh),
+                        Ok((qh, serial)) => {
+                            qemu_instances.push(qh);
+                            serials.push(serial);
+                        }
                         Err(e) => {
                             error!(?e, "Could not create worker");
                         }
@@ -374,15 +380,16 @@ fn run_commands_stop_at_first_error<'nc>(
     qemu_instances: &mut Vec<QemuProcessHandle<'nc>>,
     serials: &mut Vec<JoinHandle<Result<(), Error>>>,
     commands: Vec<ScriptCommands>,
-    nanos_dir: Option<Utf8PathBuf>,
 ) -> Result<(), Error> {
     for command in commands {
         match command {
             ScriptCommands::AddWorker(args) => {
-                qemu_instances.push(add_worker(&bridges, args)?);
+                let (qh, serial) = add_worker(&bridges, args)?;
+                qemu_instances.push(qh);
+                serials.push(serial);
             }
             ScriptCommands::AddUnikernel(args) => {
-                let (qh, serial) = add_unikernel(&bridges, args, &nanos_dir)?;
+                let (qh, serial) = add_unikernel(&bridges, args)?;
                 qemu_instances.push(qh);
                 serials.push(serial);
             }
@@ -395,7 +402,6 @@ fn run_commands_stop_at_first_error<'nc>(
 fn script_main(
     args: ScriptArgs,
     keep_bridge_alive: bool,
-    nanos_dir: Option<Utf8PathBuf>,
 ) -> Result<(), Error> {
     let file: Box<dyn std::io::Read + 'static> = if let Some(ref path) = args.config {
         Box::from(File::open(path).map_err(|e| Error::ScriptFileNotFound(e, path.clone()))?)
@@ -413,28 +419,31 @@ fn script_main(
         *stop = true;
         cvar.notify_one();
     })
-    .expect("Error settings ctrl-c handler");
+        .expect("Error settings ctrl-c handler");
 
     let bridges = futures_lite::future::block_on(network_setup(args.ip_range));
     {
         let mut qemu_instances = vec![];
         let mut serials = vec![];
-
-        if run_commands_stop_at_first_error(
+        let result = run_commands_stop_at_first_error(
             &bridges,
             &mut qemu_instances,
             &mut serials,
             script.commands,
-            nanos_dir,
-        )
-        .is_ok()
-        {
-            info!("Commands run successful, waiting for Ctr-C");
-            let (lock, cvar) = &*pair;
-            let mut started = lock.lock().unwrap();
-            // As long as the value inside the `Mutex<bool>` is `false`, we wait.
-            while !*started {
-                started = cvar.wait(started).unwrap();
+        );
+
+        match result {
+            Ok(_) => {
+                info!("Commands run successful, waiting for Ctr-C");
+                let (lock, cvar) = &*pair;
+                let mut started = lock.lock().unwrap();
+                // As long as the value inside the `Mutex<bool>` is `false`, we wait.
+                while !*started {
+                    started = cvar.wait(started).unwrap();
+                }
+            }
+            Err(e) => {
+                error!("Commands failed: {:?}", e)
             }
         }
     }
@@ -452,11 +461,11 @@ fn main() {
 
     match args.command {
         VMLauncherCommand::Interactive(ia) => {
-            interactive_main(ia, args.keep_bridge_alive, args.nanos_src_dir)
+            interactive_main(ia, args.keep_bridge_alive)
                 .expect("Interactive Failed")
         }
         VMLauncherCommand::Script(sa) => {
-            script_main(sa, args.keep_bridge_alive, args.nanos_src_dir).expect("Script Failed")
+            script_main(sa, args.keep_bridge_alive).expect("Script Failed")
         }
     };
 }

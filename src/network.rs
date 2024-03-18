@@ -9,7 +9,7 @@ use ipnet::{IpSub, Ipv4AddrRange, Ipv4Net};
 use itertools::Itertools;
 use macaddr::MacAddr;
 use rand::random;
-use tracing::warn;
+use tracing::{warn, Level, instrument};
 
 use crate::shell::{run_shell_command, ShellError};
 
@@ -19,7 +19,7 @@ struct Bridge {
     ip_addr: Ipv4Net,
 }
 
-#[tracing::instrument]
+#[instrument(level = tracing::Level::DEBUG)]
 pub(crate) async fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
     sudo::escalate_if_needed().unwrap();
     let network = Bridge::create_bridge("tbr0".to_string(), ip_net).await;
@@ -33,7 +33,7 @@ pub(crate) async fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
     };
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = tracing::Level::DEBUG)]
 pub(crate) async fn network_cleanup(nc: NetworkConfig) {
     nc.bridges.destroy().await;
 }
@@ -43,12 +43,12 @@ impl Bridge {
         self.ip_addr.hosts().next().unwrap()
     }
     fn parse_ip_show_output(output: &str) -> Result<Ipv4Net, String> {
-        let inet_line = output.lines().find(|l| l.trim().starts_with("inet"));
-        let ip = inet_line.unwrap().split_whitespace().nth(1);
+        let inet_line = output.lines().find(|l| l.trim().starts_with("inet")).ok_or("no ipv4".to_string())?;
+        let ip = inet_line.split_whitespace().nth(1);
         Ok(str::parse(ip.unwrap()).unwrap_or(Ipv4Net::from_str("10.0.0.1/24").unwrap()))
     }
     async fn find_all() -> Result<Vec<Bridge>, ShellError> {
-        let output = run_brctl_command("show", vec![]).await?;
+        let output = run_brctl_command("show", &vec![]).await?;
         if output.is_empty() {
             return Ok(vec![]);
         }
@@ -60,6 +60,7 @@ impl Bridge {
                 .expect("could not fetch further info about net device");
 
             let ip = Self::parse_ip_show_output(&ip_show_output);
+            if ip.is_err() { continue; }
             bridges.push(Bridge {
                 name: name.to_string(),
                 ip_addr: ip.unwrap(),
@@ -69,7 +70,7 @@ impl Bridge {
         Ok(bridges)
     }
     async fn register_tap_device(&self, tap: &Tap) {
-        run_brctl_command("addif", vec![&self.name, &tap.name])
+        run_brctl_command("addif", &vec![&self.name, &tap.name])
             .await
             .expect("Could not register tap device at bridge");
     }
@@ -96,7 +97,7 @@ impl Bridge {
             }
         }
 
-        run_brctl_command("addbr", vec![&new_bridge.name])
+        run_brctl_command("addbr", &vec![&new_bridge.name])
             .await
             .expect("Could not create bridge");
 
@@ -113,15 +114,15 @@ impl Bridge {
                 &new_bridge.name,
             ],
         )
-        .await
-        .expect("Could not set ip addr");
+            .await
+            .expect("Could not set ip addr");
 
         run_ip_command(
             "route",
             vec!["add", &ip_net.to_string(), "dev", &new_bridge.name],
         )
-        .await
-        .expect("Could not configure route");
+            .await
+            .expect("Could not configure route");
 
         new_bridge
     }
@@ -131,12 +132,12 @@ impl Bridge {
             "route",
             vec!["del", &self.ip_addr.to_string(), "dev", &self.name],
         )
-        .await
-        .expect("could not delete route");
+            .await
+            .expect("could not delete route");
         run_ip_command("link", vec!["set", "dev", &self.name, "down"])
             .await
             .expect("could not bring bridge down");
-        run_brctl_command("delbr", vec![&self.name])
+        run_brctl_command("delbr", &vec![&self.name])
             .await
             .expect("could not delete bridge");
     }
@@ -173,31 +174,31 @@ impl Tap {
     }
 }
 
-#[tracing::instrument(level = tracing::Level::DEBUG)]
+#[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
 async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/ip",
-        vec![command].into_iter().chain(args.into_iter()).collect(),
+        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
     )
-    .await
+        .await
 }
 
-#[tracing::instrument(level = tracing::Level::DEBUG)]
-async fn run_brctl_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
+#[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
+async fn run_brctl_command(command: &str, args: &Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/sbin/brctl",
-        vec![command].into_iter().chain(args.into_iter()).collect(),
+        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
     )
-    .await
+        .await
 }
 
-#[tracing::instrument]
-async fn run_tunctl_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
+#[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
+async fn run_tunctl_command(command: &str, args: &Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/tunctl",
-        vec![command].into_iter().chain(args.into_iter()).collect(),
+        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
     )
-    .await
+        .await
 }
 
 #[derive(Debug)]
