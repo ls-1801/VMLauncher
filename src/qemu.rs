@@ -3,8 +3,10 @@ use async_std::os::unix::net::UnixStream;
 use async_std::{io, task};
 use rand::random;
 use std::fmt::{Display, Formatter};
+use std::fs::Permissions;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
@@ -17,12 +19,12 @@ use tracing::{info, instrument};
 
 use crate::network::TapUser;
 use crate::qemu::MachineType::Q35;
-use crate::shell;
+use crate::shell::{self, ShellError};
 use crate::shell::{run_command_without_output, run_shell_command};
 
 #[derive(Debug)]
-pub struct LaunchConfiguration<'nc> {
-    pub(crate) tap: TapUser<'nc>,
+pub struct LaunchConfiguration {
+    pub(crate) tap: TapUser,
     pub(crate) image_path: PathBuf,
     pub(crate) temp_dir: TempDir,
     pub(crate) firmware: Vec<QemuFirmwareConfig>,
@@ -75,12 +77,12 @@ impl QemuCommandLineArgs for MountedFilesystem {
     }
 }
 
-struct QemuConfig<'tap, 'nc: 'tap> {
+struct QemuConfig<'tap> {
     name: Option<String>,
     memory_in_megabytes: Option<usize>,
     number_of_cores: Option<usize>,
     rng_device: bool,
-    tap: Option<&'tap TapUser<'nc>>,
+    tap: Option<&'tap TapUser>,
     firmware: Vec<QemuFirmwareConfig>,
     virtio_drives: Vec<PathBuf>,
     mounted_filesystems: Vec<MountedFilesystem>,
@@ -94,7 +96,7 @@ fn bool_option(b: bool) -> Option<()> {
     }
 }
 
-impl QemuCommandLineArgs for QemuConfig<'_, '_> {
+impl QemuCommandLineArgs for QemuConfig<'_> {
     fn as_args(&self) -> impl Iterator<Item = String> {
         self.virtio_drives
             .iter()
@@ -259,7 +261,7 @@ impl QemuCommandLineArgs for QemuSerial {
     }
 }
 
-fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
+fn create_qemu_arguments(lc: &LaunchConfiguration) -> Vec<String> {
     let qr = QemuRunMode {
         monitor: Some(QemuMonitor {
             monitor_socket_path: lc.temp_dir.path().join("monitor.socket"),
@@ -299,8 +301,8 @@ fn create_qemu_arguments(lc: &LaunchConfiguration<'_>) -> Vec<String> {
 }
 
 #[derive(Debug)]
-pub struct QemuProcessHandle<'nc> {
-    lc: Option<LaunchConfiguration<'nc>>,
+pub struct QemuProcessHandle {
+    lc: Option<LaunchConfiguration>,
 }
 
 struct PidNoLongerExists {
@@ -308,7 +310,7 @@ struct PidNoLongerExists {
     ps_process_future: Option<Pin<Box<dyn Future<Output = io::Result<ExitStatus>>>>>,
 }
 
-impl<'nc> QemuProcessHandle<'nc> {
+impl QemuProcessHandle {
     fn monitor_path(&self) -> PathBuf {
         self.lc
             .as_ref()
@@ -417,7 +419,7 @@ impl<'nc> QemuProcessHandle<'nc> {
     }
 }
 
-impl<'nc> Display for QemuProcessHandle<'nc> {
+impl Display for QemuProcessHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
             "TapDevice: {}, Ip: {}",
@@ -427,7 +429,7 @@ impl<'nc> Display for QemuProcessHandle<'nc> {
     }
 }
 
-impl<'nc> Drop for QemuProcessHandle<'nc> {
+impl Drop for QemuProcessHandle {
     fn drop(&mut self) {
         if self.lc.is_some() {
             task::block_on(self.stop());
@@ -443,7 +445,10 @@ pub async fn serial_with_command(
     let connection = io::timeout(Duration::from_secs(1), UnixStream::connect(serial_socket)).await;
     let mut connection = connection.map_err(SerialError::Connecting)?;
 
-    connection.write_all(command.as_bytes()).await.map_err(SerialError::Writing)?;
+    connection
+        .write_all(command.as_bytes())
+        .await
+        .map_err(SerialError::Writing)?;
 
     serial_listen(connection, node_id).await
 }
@@ -600,7 +605,7 @@ pub enum SerialError {
 }
 
 #[instrument]
-pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> Result<QemuProcessHandle<'nc>> {
+pub async fn start_qemu(lc: LaunchConfiguration) -> Result<QemuProcessHandle> {
     run_shell_command(
         QEMU_BINARY,
         &create_qemu_arguments(&lc)
@@ -611,5 +616,13 @@ pub async fn start_qemu<'nc>(lc: LaunchConfiguration<'nc>) -> Result<QemuProcess
     .await
     .map_err(|e| QemuError::Shell(e))?;
 
-    Ok(QemuProcessHandle { lc: Some(lc) })
+    let qh = QemuProcessHandle { lc: Some(lc) };
+    async_std::fs::set_permissions(qh.serial_path(), Permissions::from_mode(0o666))
+        .await
+        .map_err(|e| QemuError::IO(e, "Changing permission of Serial"))?;
+    async_std::fs::set_permissions(qh.monitor_path(), Permissions::from_mode(0o666))
+        .await
+        .map_err(|e| QemuError::IO(e, "Changing permission of Monitor"))?;
+
+    Ok(qh)
 }

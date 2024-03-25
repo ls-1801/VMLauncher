@@ -9,6 +9,7 @@ edition = "2021"
 # async
 async-process = "2.0.1"
 futures-lite = "2.2.0"
+futures = "0.3.30"
 
 # logging
 tracing = "0.1.40"

@@ -1,7 +1,7 @@
-use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::{cell::RefCell, sync};
 
 use async_std::task;
 
@@ -9,11 +9,11 @@ use ipnet::{IpSub, Ipv4AddrRange, Ipv4Net};
 use itertools::Itertools;
 use macaddr::MacAddr;
 use rand::random;
-use tracing::{warn, Level, instrument};
+use tracing::{instrument, warn, Level};
 
 use crate::shell::{run_shell_command, ShellError};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Bridge {
     name: String,
     ip_addr: Ipv4Net,
@@ -26,9 +26,11 @@ pub(crate) async fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
 
     return NetworkConfig {
         bridges: network,
-        ip_allocator: RefCell::new(IpAddressAllocator::new(Ipv4AddrRange::new(
-            "10.0.0.2".parse().unwrap(),
-            "10.0.0.20".parse().unwrap(),
+        ip_allocator: sync::Arc::new(sync::RwLock::new(IpAddressAllocator::new(
+            Ipv4AddrRange::new(
+                ip_net.hosts().skip(1).next().unwrap(),
+                ip_net.hosts().last().unwrap(),
+            ),
         ))),
     };
 }
@@ -43,7 +45,10 @@ impl Bridge {
         self.ip_addr.hosts().next().unwrap()
     }
     fn parse_ip_show_output(output: &str) -> Result<Ipv4Net, String> {
-        let inet_line = output.lines().find(|l| l.trim().starts_with("inet")).ok_or("no ipv4".to_string())?;
+        let inet_line = output
+            .lines()
+            .find(|l| l.trim().starts_with("inet"))
+            .ok_or("no ipv4".to_string())?;
         let ip = inet_line.split_whitespace().nth(1);
         Ok(str::parse(ip.unwrap()).unwrap_or(Ipv4Net::from_str("10.0.0.1/24").unwrap()))
     }
@@ -60,7 +65,9 @@ impl Bridge {
                 .expect("could not fetch further info about net device");
 
             let ip = Self::parse_ip_show_output(&ip_show_output);
-            if ip.is_err() { continue; }
+            if ip.is_err() {
+                continue;
+            }
             bridges.push(Bridge {
                 name: name.to_string(),
                 ip_addr: ip.unwrap(),
@@ -114,15 +121,15 @@ impl Bridge {
                 &new_bridge.name,
             ],
         )
-            .await
-            .expect("Could not set ip addr");
+        .await
+        .expect("Could not set ip addr");
 
         run_ip_command(
             "route",
             vec!["add", &ip_net.to_string(), "dev", &new_bridge.name],
         )
-            .await
-            .expect("Could not configure route");
+        .await
+        .expect("Could not configure route");
 
         new_bridge
     }
@@ -132,8 +139,8 @@ impl Bridge {
             "route",
             vec!["del", &self.ip_addr.to_string(), "dev", &self.name],
         )
-            .await
-            .expect("could not delete route");
+        .await
+        .expect("could not delete route");
         run_ip_command("link", vec!["set", "dev", &self.name, "down"])
             .await
             .expect("could not bring bridge down");
@@ -178,27 +185,36 @@ impl Tap {
 async fn run_ip_command(command: &str, args: Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/ip",
-        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
+        &vec![command]
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect(),
     )
-        .await
+    .await
 }
 
 #[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
 async fn run_brctl_command(command: &str, args: &Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/sbin/brctl",
-        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
+        &vec![command]
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect(),
     )
-        .await
+    .await
 }
 
 #[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
 async fn run_tunctl_command(command: &str, args: &Vec<&str>) -> Result<String, ShellError> {
     run_shell_command(
         "/usr/bin/tunctl",
-        &vec![command].into_iter().chain(args.iter().cloned()).collect(),
+        &vec![command]
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect(),
     )
-        .await
+    .await
 }
 
 #[derive(Debug)]
@@ -294,19 +310,19 @@ fn ip_allocation() {
     assert_eq!(allocator.allocate(), Some("10.0.0.6".parse().unwrap()));
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NetworkConfig {
     bridges: Bridge,
-    ip_allocator: RefCell<IpAddressAllocator>,
+    ip_allocator: std::sync::Arc<sync::RwLock<IpAddressAllocator>>,
 }
 
 #[derive(Debug)]
-pub(crate) struct TapUser<'nc> {
-    config: &'nc NetworkConfig,
+pub(crate) struct TapUser {
+    config: NetworkConfig,
     tap: Option<Tap>,
 }
 
-impl TapUser<'_> {
+impl TapUser {
     pub fn device(&self) -> &str {
         &self.tap.as_ref().unwrap().name
     }
@@ -318,7 +334,7 @@ impl TapUser<'_> {
     }
 }
 
-impl<'nc> Drop for TapUser<'nc> {
+impl Drop for TapUser {
     fn drop(&mut self) {
         if let Some(tap) = self.tap.take() {
             task::block_on(self.config.release_tap(tap));
@@ -333,19 +349,20 @@ impl NetworkConfig {
     pub async fn get_tap(&self) -> TapUser {
         let ip = self
             .ip_allocator
-            .borrow_mut()
+            .write()
+            .unwrap()
             .allocate()
             .expect("Out of ips");
-        let id = self.ip_allocator.borrow().to_id(ip);
+        let id = self.ip_allocator.read().unwrap().to_id(ip);
         let tap = Tap::create(format!("tap{id}"), ip).await;
         self.bridges.register_tap_device(&tap).await;
         TapUser {
-            config: self,
+            config: self.clone(),
             tap: Some(tap),
         }
     }
     async fn release_tap(&self, tap: Tap) {
-        self.ip_allocator.borrow_mut().free(tap.ip_addr);
+        self.ip_allocator.write().unwrap().free(tap.ip_addr);
         tap.destroy().await;
     }
 }

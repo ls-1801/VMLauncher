@@ -100,11 +100,11 @@ fn create_configuration(wc: &WorkerConfiguration) -> FlatcarConfig {
     }
 }
 
-pub(crate) async fn prepare_launch<'nc>(
+pub(crate) async fn prepare_launch(
     wc: WorkerConfiguration,
-    tap: TapUser<'nc>,
+    tap: TapUser,
     args: &Args,
-) -> LaunchConfiguration<'nc> {
+) -> LaunchConfiguration {
     let temp_dir = TempDir::new(&format!("worker_{}", wc.worker_id)).unwrap();
     let image_path = temp_dir.path().join("flatcar_fresh.iso");
     let ignition_path = temp_dir.path().join("ignition.json");
@@ -128,7 +128,7 @@ pub(crate) async fn prepare_launch<'nc>(
             path: temp_dir.path().join("ignition.json"),
         }],
         num_cores: args.number_of_cores,
-        memory_in_mega_bytes: None,
+        memory_in_mega_bytes: Some(512 * 1024),
         temp_dir,
     }
 }

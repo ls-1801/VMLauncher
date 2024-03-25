@@ -22,7 +22,13 @@ pub struct Args {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) klib_dir: Option<String>,
     pub(crate) debugflags: Vec<String>,
+    pub(crate) run_config: RunConfig,
+}
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RunConfig {
+    pub(crate) gateway: Ipv4Addr,
 }
 
 #[derive(Debug)]
@@ -54,17 +60,18 @@ pub(crate) enum NanosError {
     UsageError(String),
 }
 
-pub(crate) async fn prepare_launch<'nc>(
+pub(crate) async fn prepare_launch(
     worker_configuration: UnikernelWorkerConfig,
-    tap: TapUser<'nc>,
+    tap: TapUser,
     args: &Args,
-) -> Result<LaunchConfiguration<'nc>, NanosError> {
+) -> Result<LaunchConfiguration, NanosError> {
     let image_name = worker_configuration.image_name();
     let temp_dir = tempdir::TempDir::new(&image_name)
         .map_err(|e| NanosError::FileSystem(e, "Creating Tempdir"))?;
     let dest_image_path = temp_dir.path().join(".ops/images").join(&image_name);
 
-    async_std::fs::create_dir_all(dest_image_path.parent().unwrap()).await
+    async_std::fs::create_dir_all(dest_image_path.parent().unwrap())
+        .await
         .map_err(|e| NanosError::FileSystem(e, "creating ops image dir"))?;
 
     let ip_string = worker_configuration
@@ -82,13 +89,17 @@ pub(crate) async fn prepare_launch<'nc>(
         .map_err(|e| NanosError::FileSystem(e, "Writing Config"))?;
 
     if !worker_configuration.elf_binary.is_file() {
-        return Err(NanosError::UsageError(format!("{} is not a file", worker_configuration.elf_binary.as_str())));
+        return Err(NanosError::UsageError(format!(
+            "{} is not a file",
+            worker_configuration.elf_binary.as_str()
+        )));
     }
 
     let elf_binary_filename = worker_configuration.elf_binary.file_name().unwrap();
     let docker_internal_filename = Utf8PathBuf::from("/input/").join(elf_binary_filename);
 
-    let docker_internal_config_file = Utf8PathBuf::from("/config/").join(nanos_config_file.file_name().unwrap().to_str().unwrap());
+    let docker_internal_config_file = Utf8PathBuf::from("/config/")
+        .join(nanos_config_file.file_name().unwrap().to_str().unwrap());
 
     let mut ops_args = vec![
         "build",
@@ -110,13 +121,37 @@ pub(crate) async fn prepare_launch<'nc>(
         }
     }
 
-    let input_mount = format!("{}:/input", worker_configuration.elf_binary.parent().unwrap().as_str());
-    let output_mount = format!("{}:/output", temp_dir.path().join(".ops/images").as_path().to_str().unwrap());
+    let input_mount = format!(
+        "{}:/input",
+        worker_configuration.elf_binary.parent().unwrap().as_str()
+    );
+    let output_mount = format!(
+        "{}:/output",
+        temp_dir
+            .path()
+            .join(".ops/images")
+            .as_path()
+            .to_str()
+            .unwrap()
+    );
     let config_mount = format!("{}:/config", temp_dir.path().to_str().unwrap());
-    let mut docker_args = vec!["run", "--rm", "-v", &input_mount, "-v", &output_mount, "-v", &config_mount, "ops"];
+    let mut docker_args = vec![
+        "run",
+        "--rm",
+        "-v",
+        &input_mount,
+        "-v",
+        &output_mount,
+        "-v",
+        &config_mount,
+        "ops",
+    ];
     docker_args.append(&mut ops_args);
 
-    if let Err(e) = shell::run_shell_command("docker", &docker_args).await.map_err(NanosError::Shell) {
+    if let Err(e) = shell::run_shell_command("docker", &docker_args)
+        .await
+        .map_err(NanosError::Shell)
+    {
         error!(args = docker_args.join(" "), "could not run docker");
         async_std::task::sleep(std::time::Duration::from_secs(200)).await;
         return Err(e);
@@ -128,6 +163,6 @@ pub(crate) async fn prepare_launch<'nc>(
         temp_dir,
         firmware: vec![],
         num_cores: Some(1),
-        memory_in_mega_bytes: Some(1024),
+        memory_in_mega_bytes: Some(512),
     })
 }

@@ -1,12 +1,14 @@
-use async_std::future::timeout;
+use async_std::future::{self, timeout};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::stdin;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::sleep;
 use std::time::Duration;
 
+use crate::nanos::RunConfig;
 use crate::nes::{
     Format, Source, TCPSourceConfig, TCPSourceConfigBuilder,
     WorkerQueryProcessingConfigurationBuilder,
@@ -23,7 +25,9 @@ use thiserror::Error;
 use tracing::{error, info};
 
 use crate::network::{network_cleanup, network_setup, NetworkConfig};
-use crate::qemu::{serial, start_qemu, QemuError, QemuProcessHandle, SerialError, serial_with_command};
+use crate::qemu::{
+    serial, serial_with_command, start_qemu, QemuError, QemuProcessHandle, SerialError,
+};
 use crate::templates::WorkerConfiguration;
 
 mod flatcar;
@@ -33,6 +37,7 @@ mod network;
 mod qemu;
 mod shell;
 mod templates;
+// mod firecracker;
 
 #[derive(Parser)]
 struct ProgramArgs {
@@ -114,10 +119,10 @@ impl AddUnikernelArgs {
     }
 }
 
-fn add_unikernel<'a>(
-    nc: &'a NetworkConfig,
+async fn add_unikernel(
+    nc: NetworkConfig,
     args: AddUnikernelArgs,
-) -> Result<(QemuProcessHandle<'a>, JoinHandle<Result<(), Error>>), Error> {
+) -> Result<(QemuProcessHandle, Result<(), Error>), Error> {
     let wc = nanos::UnikernelWorkerConfig {
         node_id: args.node_id,
         query_id: args.query_id,
@@ -126,47 +131,46 @@ fn add_unikernel<'a>(
         ip: args.ip,
     };
 
-    task::block_on(async move {
-        let tap = nc.get_tap().await;
-        let lc = nanos::prepare_launch(
-            wc,
-            tap,
-            &nanos::Args {
-                klib_dir: None,
-                kernel: None,
-                klibs: vec!["shmem".to_string(), "tmpfs".to_string()],
-                debugflags: vec![],
+    let tap = nc.get_tap().await;
+    let lc = nanos::prepare_launch(
+        wc,
+        tap,
+        &nanos::Args {
+            klib_dir: None,
+            kernel: None,
+            klibs: vec!["shmem".to_string(), "tmpfs".to_string()],
+            debugflags: vec![],
+            run_config: RunConfig {
+                gateway: nc.host_ip(),
             },
-        )
+        },
+    )
+    .await
+    .map_err(Error::Nanos)?;
+    let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
+    let serial_socket = handle.serial_path();
+    Ok((
+        handle,
+        serial(serial_socket, args.node_id)
             .await
-            .map_err(Error::Nanos)?;
-        let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
-        let serial_socket = handle.serial_path();
-        Ok((
-            handle,
-            task::spawn(async move {
-                serial(serial_socket, args.node_id)
-                    .await
-                    .map_err(|e| Error::QemuSerial(e))
-            }),
-        ))
-    })
+            .map_err(|e| Error::QemuSerial(e)),
+    ))
 }
 
-struct ProcessOption<'a, 'b: 'a> {
+struct ProcessOption<'a> {
     index: usize,
-    qph: &'a mut QemuProcessHandle<'b>,
+    qph: &'a mut QemuProcessHandle,
 }
 
-impl Display for ProcessOption<'_, '_> {
+impl Display for ProcessOption<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}", self.qph))
     }
 }
 
 fn run_stop<'a>(
-    instances: &mut Vec<QemuProcessHandle<'a>>,
-) -> Result<Vec<QemuProcessHandle<'a>>, (Vec<QemuProcessHandle<'a>>, Error)> {
+    instances: &mut Vec<QemuProcessHandle>,
+) -> Result<Vec<QemuProcessHandle>, (Vec<QemuProcessHandle>, Error)> {
     let options = instances
         .iter_mut()
         .enumerate()
@@ -208,6 +212,7 @@ fn run_stop<'a>(
 struct AddWorkerArgs {
     worker_id: usize,
     number_of_worker_threads: usize,
+    number_of_sources: usize,
 }
 
 impl AddWorkerArgs {
@@ -215,64 +220,73 @@ impl AddWorkerArgs {
         let worker_id = inquire::CustomType::<usize>::new("WorkerId?").prompt()?;
         let number_of_worker_threads =
             inquire::CustomType::<usize>::new("Number of Worker Threads?").prompt()?;
+        let number_of_sources = inquire::CustomType::<usize>::new("with source?")
+            .with_default(0)
+            .prompt()?;
         Ok(Self {
             worker_id,
             number_of_worker_threads,
+            number_of_sources,
         })
     }
 }
 
-fn add_worker<'a>(nc: &'a NetworkConfig, args: AddWorkerArgs) -> Result<(QemuProcessHandle<'a>, JoinHandle<Result<(), Error>>), Error> {
-    let tap = task::block_on(nc.get_tap());
+async fn add_worker(
+    nc: NetworkConfig,
+    args: AddWorkerArgs,
+) -> Result<(QemuProcessHandle, Result<(), Error>), Error> {
+    let tap = nc.get_tap().await;
     let worker_id = args.worker_id;
+
+    let sources = (0..args.number_of_sources)
+        .map(|i| {
+            TCPSourceConfigBuilder::default()
+                .format(Format::NES(8))
+                .socket_port(8071 + i as u16)
+                .logical_source_name("bid".to_string())
+                .physical_source_name(format!("bid_phy_{i}"))
+                .flush_interval(std::time::Duration::from_millis(1))
+                .build()
+                .unwrap()
+                .into()
+        })
+        .collect::<Vec<_>>();
+
     let worker_config = WorkerConfiguration {
         host_ip_addr: IpAddr::from(nc.host_ip()),
         ip_addr: IpAddr::from(*tap.ip()),
         worker_id: args.worker_id,
         parent_id: args.worker_id - 1,
-        sources: vec![TCPSourceConfigBuilder::default()
-            .format(Format::NES(8))
-            .socket_port(8091)
-            .logical_source_name("bid".to_string())
-            .build()
-            .unwrap()
-            .into()],
+        sources,
         log_level: "LOG_INFO",
         query_processing: WorkerQueryProcessingConfigurationBuilder::default()
             .number_of_worker_threads(args.number_of_worker_threads)
             .buffer_size(8192)
-            .number_of_source_buffers(128)
-            .total_number_of_buffers(4096)
+            .number_of_source_buffers(32)
+            .total_number_of_buffers(2000000)
             .number_of_buffers_per_thread(128)
             .build()
             .unwrap()
             .into(),
     };
-    task::block_on(async move {
-        let wc = worker_config;
-        let args = flatcar::Args {
-            flatcar_fresh_image: PathBuf::from("./flatcar_fresh.iso"),
-            number_of_cores: Some(args.number_of_worker_threads),
-        };
-        let lc = flatcar::prepare_launch(wc, tap, &args).await;
-        let handle = qemu::start_qemu(lc).await.map_err(Error::Qemu)?;
-        let serial_socket = handle.serial_path();
-        Ok((
-            handle,
-            task::spawn(async move {
-                task::sleep(Duration::from_secs(20)).await;
-                serial_with_command("journalctl -u nesWorker -f\n", serial_socket, worker_id)
-                    .await
-                    .map_err(|e| Error::QemuSerial(e))
-            }),
-        ))
-    })
+    let wc = worker_config;
+    let args = flatcar::Args {
+        flatcar_fresh_image: PathBuf::from("./flatcar_fresh.iso"),
+        number_of_cores: Some(args.number_of_worker_threads),
+    };
+    let lc = flatcar::prepare_launch(wc, tap, &args).await;
+    let handle = qemu::start_qemu(lc).await.map_err(Error::Qemu)?;
+    let serial_socket = handle.serial_path();
+    task::sleep(Duration::from_secs(20)).await;
+    Ok((
+        handle,
+        serial_with_command("journalctl -u nesWorker -f\n", serial_socket, worker_id)
+            .await
+            .map_err(|e| Error::QemuSerial(e)),
+    ))
 }
 
-fn interactive_main(
-    args: InteractiveArgs,
-    keep_bridge_alive: bool,
-) -> Result<(), Error> {
+fn interactive_main(args: InteractiveArgs, keep_bridge_alive: bool) -> Result<(), Error> {
     let gateway_ip = args
         .ip_range
         .or_else(|| {
@@ -301,7 +315,7 @@ fn interactive_main(
                 Ok(action) => match action {
                     "uk" => match AddUnikernelArgs::inquire()
                         .map_err(Error::Inquire)
-                        .and_then(|args| add_unikernel(&bridges, args))
+                        .and_then(|args| task::block_on(add_unikernel(bridges.clone(), args)))
                     {
                         Ok((qh, serial)) => {
                             qemu_instances.push(qh);
@@ -339,11 +353,10 @@ fn interactive_main(
                     }
                     "add worker" => match AddWorkerArgs::inquire()
                         .map_err(Error::Inquire)
-                        .and_then(|args| add_worker(&bridges, args))
+                        .and_then(|args| task::block_on(add_worker(bridges.clone(), args)))
                     {
                         Ok((qh, serial)) => {
                             qemu_instances.push(qh);
-                            serials.push(serial);
                         }
                         Err(e) => {
                             error!(?e, "Could not create worker");
@@ -375,34 +388,37 @@ enum ScriptCommands {
     AddUnikernel(AddUnikernelArgs),
 }
 
-fn run_commands_stop_at_first_error<'nc>(
-    bridges: &'nc NetworkConfig,
-    qemu_instances: &mut Vec<QemuProcessHandle<'nc>>,
+fn run_commands_stop_at_first_error(
+    bridges: &NetworkConfig,
+    qemu_instances: &mut Vec<QemuProcessHandle>,
     serials: &mut Vec<JoinHandle<Result<(), Error>>>,
     commands: Vec<ScriptCommands>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Error> {
+    let mut startup_tasks = vec![];
     for command in commands {
         match command {
             ScriptCommands::AddWorker(args) => {
-                let (qh, serial) = add_worker(&bridges, args)?;
-                qemu_instances.push(qh);
-                serials.push(serial);
+                startup_tasks.push(task::spawn(add_worker(bridges.clone(), args)));
+                sleep(Duration::from_secs(10));
             }
             ScriptCommands::AddUnikernel(args) => {
-                let (qh, serial) = add_unikernel(&bridges, args)?;
-                qemu_instances.push(qh);
-                serials.push(serial);
+                startup_tasks.push(task::spawn(add_unikernel(bridges.clone(), args)));
             }
         }
+        let has_stopped = stop.as_ref().0.lock().unwrap();
+        if *has_stopped {
+            info!("Script interrupted");
+            return Ok(());
+        }
     }
+
+    futures::future::join_all(startup_tasks);
 
     Ok(())
 }
 
-fn script_main(
-    args: ScriptArgs,
-    keep_bridge_alive: bool,
-) -> Result<(), Error> {
+fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
     let file: Box<dyn std::io::Read + 'static> = if let Some(ref path) = args.config {
         Box::from(File::open(path).map_err(|e| Error::ScriptFileNotFound(e, path.clone()))?)
     } else {
@@ -419,7 +435,7 @@ fn script_main(
         *stop = true;
         cvar.notify_one();
     })
-        .expect("Error settings ctrl-c handler");
+    .expect("Error settings ctrl-c handler");
 
     let bridges = futures_lite::future::block_on(network_setup(args.ip_range));
     {
@@ -430,16 +446,17 @@ fn script_main(
             &mut qemu_instances,
             &mut serials,
             script.commands,
+            pair.clone(),
         );
 
         match result {
             Ok(_) => {
                 info!("Commands run successful, waiting for Ctr-C");
                 let (lock, cvar) = &*pair;
-                let mut started = lock.lock().unwrap();
+                let mut stopped = lock.lock().unwrap();
                 // As long as the value inside the `Mutex<bool>` is `false`, we wait.
-                while !*started {
-                    started = cvar.wait(started).unwrap();
+                while !*stopped {
+                    stopped = cvar.wait(stopped).unwrap();
                 }
             }
             Err(e) => {
@@ -461,8 +478,7 @@ fn main() {
 
     match args.command {
         VMLauncherCommand::Interactive(ia) => {
-            interactive_main(ia, args.keep_bridge_alive)
-                .expect("Interactive Failed")
+            interactive_main(ia, args.keep_bridge_alive).expect("Interactive Failed")
         }
         VMLauncherCommand::Script(sa) => {
             script_main(sa, args.keep_bridge_alive).expect("Script Failed")
@@ -471,8 +487,8 @@ fn main() {
 }
 
 fn run_restart<'a>(
-    stopped_instances: &mut Vec<QemuProcessHandle<'a>>,
-) -> Result<Vec<QemuProcessHandle<'a>>, (Vec<QemuProcessHandle<'a>>, Error)> {
+    stopped_instances: &mut Vec<QemuProcessHandle>,
+) -> Result<Vec<QemuProcessHandle>, (Vec<QemuProcessHandle>, Error)> {
     let options = stopped_instances
         .iter_mut()
         .enumerate()
