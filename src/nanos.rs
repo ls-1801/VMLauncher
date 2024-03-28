@@ -1,8 +1,11 @@
+use crate::nanos::NanosError::HomeDir;
 use camino::Utf8PathBuf;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use tempdir::TempDir;
 use thiserror::Error;
 use tracing::error;
 use tracing_subscriber::fmt::format;
@@ -11,7 +14,8 @@ use which::which;
 use crate::network::TapUser;
 use crate::qemu::LaunchConfiguration;
 use crate::shell;
-use crate::shell::ShellError;
+use crate::shell::{run_shell_command, run_shell_command_with_env, ShellError};
+use crate::templates::WorkerConfiguration;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -95,17 +99,25 @@ pub(crate) async fn prepare_launch(
         )));
     }
 
-    let elf_binary_filename = worker_configuration.elf_binary.file_name().unwrap();
-    let docker_internal_filename = Utf8PathBuf::from("/input/").join(elf_binary_filename);
-
-    let docker_internal_config_file = Utf8PathBuf::from("/config/")
-        .join(nanos_config_file.file_name().unwrap().to_str().unwrap());
+    let (binary_name, config_file) = if args.use_docker {
+        let elf_binary_filename = worker_configuration.elf_binary.file_name().unwrap();
+        (
+            Utf8PathBuf::from("/input/").join(elf_binary_filename),
+            Utf8PathBuf::from("/config/")
+                .join(nanos_config_file.file_name().unwrap().to_str().unwrap()),
+        )
+    } else {
+        (
+            worker_configuration.elf_binary.clone(),
+            Utf8PathBuf::from_path_buf(nanos_config_file).unwrap(),
+        )
+    };
 
     let mut ops_args = vec![
         "build",
-        docker_internal_filename.as_str(),
+        binary_name.as_str(),
         "-c",
-        docker_internal_config_file.as_str(),
+        config_file.as_str(),
         "--ip-address",
         &ip_string,
         "-i",
@@ -121,40 +133,10 @@ pub(crate) async fn prepare_launch(
         }
     }
 
-    let input_mount = format!(
-        "{}:/input",
-        worker_configuration.elf_binary.parent().unwrap().as_str()
-    );
-    let output_mount = format!(
-        "{}:/output",
-        temp_dir
-            .path()
-            .join(".ops/images")
-            .as_path()
-            .to_str()
-            .unwrap()
-    );
-    let config_mount = format!("{}:/config", temp_dir.path().to_str().unwrap());
-    let mut docker_args = vec![
-        "run",
-        "--rm",
-        "-v",
-        &input_mount,
-        "-v",
-        &output_mount,
-        "-v",
-        &config_mount,
-        "ops",
-    ];
-    docker_args.append(&mut ops_args);
-
-    if let Err(e) = shell::run_shell_command("docker", &docker_args)
-        .await
-        .map_err(NanosError::Shell)
-    {
-        error!(args = docker_args.join(" "), "could not run docker");
-        async_std::task::sleep(std::time::Duration::from_secs(200)).await;
-        return Err(e);
+    if args.use_docker {
+        ops_build_using_docker(ops_args, &worker_configuration, &temp_dir).await?
+    } else {
+        ops_build_using_local(ops_args, &worker_configuration, &dest_image_path).await?
     }
 
     Ok(LaunchConfiguration {

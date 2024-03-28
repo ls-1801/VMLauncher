@@ -12,6 +12,7 @@ use rand::random;
 use tracing::{instrument, warn, Level};
 
 use crate::shell::{run_shell_command, ShellError};
+pub(crate) mod usertap;
 
 #[derive(Debug, Clone)]
 struct Bridge {

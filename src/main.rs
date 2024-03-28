@@ -51,6 +51,7 @@ struct ProgramArgs {
 enum VMLauncherCommand {
     Interactive(InteractiveArgs),
     Script(ScriptArgs),
+    Test,
 }
 
 #[derive(Debug, Args)]
@@ -472,6 +473,12 @@ fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
     Ok(())
 }
 
+fn run_test() {
+    let tap = task::block_on(network::usertap::Tap::new("tap56")).unwrap();
+    let tap = task::block_on(network::usertap::Tap::new("tap32")).unwrap();
+    sleep(std::time::Duration::from_secs(60));
+}
+
 fn main() {
     let args = ProgramArgs::parse();
     tracing_subscriber::fmt::init();
@@ -482,6 +489,9 @@ fn main() {
         }
         VMLauncherCommand::Script(sa) => {
             script_main(sa, args.keep_bridge_alive).expect("Script Failed")
+        },
+        VMLauncherCommand::Test => {
+            run_test();
         }
     };
 }
