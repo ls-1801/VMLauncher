@@ -15,7 +15,7 @@ use std::time::Duration;
 use strum_macros::Display;
 use tempdir::TempDir;
 use thiserror::Error;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 
 use crate::network::TapUser;
 use crate::qemu::MachineType::Q35;
@@ -432,7 +432,10 @@ impl Display for QemuProcessHandle {
 impl Drop for QemuProcessHandle {
     fn drop(&mut self) {
         if self.lc.is_some() {
-            task::block_on(self.stop());
+            info!("Stopping Qemu");
+            if let Err(e) = task::block_on(self.stop()) {
+                error!("Failed to stop qemu: {e:?}");
+            }
         }
     }
 }

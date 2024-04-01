@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 use std::{cell::RefCell, sync};
 
 use async_std::task;
 
+use crate::network::userbridge::UserBridgeError;
 use ipnet::{IpSub, Ipv4AddrRange, Ipv4Net};
 use itertools::Itertools;
 use macaddr::MacAddr;
@@ -12,21 +15,20 @@ use rand::random;
 use tracing::{instrument, warn, Level};
 
 use crate::shell::{run_shell_command, ShellError};
+mod common;
+pub(crate) mod userbridge;
 pub(crate) mod usertap;
 
 #[derive(Debug, Clone)]
 struct Bridge {
-    name: String,
+    bridge: Arc<RwLock<userbridge::Bridge>>,
     ip_addr: Ipv4Net,
 }
 
 #[instrument(level = tracing::Level::DEBUG)]
-pub(crate) async fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
-    sudo::escalate_if_needed().unwrap();
-    let network = Bridge::create_bridge("tbr0".to_string(), ip_net).await;
-
+pub(crate) fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
     return NetworkConfig {
-        bridges: network,
+        bridges: Bridge::create_bridge("tbr0", ip_net).unwrap(),
         ip_allocator: sync::Arc::new(sync::RwLock::new(IpAddressAllocator::new(
             Ipv4AddrRange::new(
                 ip_net.hosts().skip(1).next().unwrap(),
@@ -37,149 +39,47 @@ pub(crate) async fn network_setup(ip_net: Ipv4Net) -> NetworkConfig {
 }
 
 #[tracing::instrument(level = tracing::Level::DEBUG)]
-pub(crate) async fn network_cleanup(nc: NetworkConfig) {
-    nc.bridges.destroy().await;
-}
+pub(crate) async fn network_cleanup(nc: NetworkConfig) {}
 
 impl Bridge {
     fn host_ip(&self) -> Ipv4Addr {
         self.ip_addr.hosts().next().unwrap()
     }
-    fn parse_ip_show_output(output: &str) -> Result<Ipv4Net, String> {
-        let inet_line = output
-            .lines()
-            .find(|l| l.trim().starts_with("inet"))
-            .ok_or("no ipv4".to_string())?;
-        let ip = inet_line.split_whitespace().nth(1);
-        Ok(str::parse(ip.unwrap()).unwrap_or(Ipv4Net::from_str("10.0.0.1/24").unwrap()))
-    }
-    async fn find_all() -> Result<Vec<Bridge>, ShellError> {
-        let output = run_brctl_command("show", &vec![]).await?;
-        if output.is_empty() {
-            return Ok(vec![]);
-        }
-        let mut bridges = vec![];
-        for line in output.lines().skip(1) {
-            let name = line.split_ascii_whitespace().next().unwrap();
-            let ip_show_output = run_ip_command("a", vec!["show", name])
-                .await
-                .expect("could not fetch further info about net device");
-
-            let ip = Self::parse_ip_show_output(&ip_show_output);
-            if ip.is_err() {
-                continue;
-            }
-            bridges.push(Bridge {
-                name: name.to_string(),
-                ip_addr: ip.unwrap(),
-            });
-        }
-
-        Ok(bridges)
-    }
-    async fn register_tap_device(&self, tap: &Tap) {
-        run_brctl_command("addif", &vec![&self.name, &tap.name])
-            .await
-            .expect("Could not register tap device at bridge");
+    fn register_tap_device(&self, tap: &Tap) {
+        self.bridge
+            .write()
+            .unwrap()
+            .add_tap(tap.tap.read().unwrap().deref())
+            .unwrap();
     }
 
-    async fn create_bridge(name: String, ip_net: Ipv4Net) -> Bridge {
-        let new_bridge = Bridge {
-            name,
+    fn create_bridge(name: &str, ip_net: Ipv4Net) -> Result<Bridge, UserBridgeError> {
+        let bridge = Arc::new(RwLock::new(userbridge::Bridge::new(name, ip_net)?));
+
+        Ok(Bridge {
+            bridge,
             ip_addr: ip_net,
-        };
-
-        if let Some(existing_bridge) = Self::find_all()
-            .await
-            .unwrap_or(vec![])
-            .into_iter()
-            .find(|b| b.name == new_bridge.name)
-        {
-            if existing_bridge.ip_addr == new_bridge.ip_addr {
-                warn!(name = new_bridge.name, ip_net = %new_bridge.ip_addr, "Bridge already exists");
-                return existing_bridge;
-            } else {
-                warn!(name = new_bridge.name, ip_net = %new_bridge.ip_addr, other_ip = %existing_bridge.ip_addr, "Bridge already exists! Deleting old");
-                return existing_bridge;
-                // Self::destroy(existing_bridge).await;
-            }
-        }
-
-        run_brctl_command("addbr", &vec![&new_bridge.name])
-            .await
-            .expect("Could not create bridge");
-
-        run_ip_command("link", vec!["set", "dev", &new_bridge.name, "up"])
-            .await
-            .expect("Could not bring bridge up");
-
-        run_ip_command(
-            "addr",
-            vec![
-                "add",
-                &new_bridge.host_ip().to_string(),
-                "dev",
-                &new_bridge.name,
-            ],
-        )
-        .await
-        .expect("Could not set ip addr");
-
-        run_ip_command(
-            "route",
-            vec!["add", &ip_net.to_string(), "dev", &new_bridge.name],
-        )
-        .await
-        .expect("Could not configure route");
-
-        new_bridge
-    }
-
-    async fn destroy(self) {
-        run_ip_command(
-            "route",
-            vec!["del", &self.ip_addr.to_string(), "dev", &self.name],
-        )
-        .await
-        .expect("could not delete route");
-        run_ip_command("link", vec!["set", "dev", &self.name, "down"])
-            .await
-            .expect("could not bring bridge down");
-        run_brctl_command("delbr", &vec![&self.name])
-            .await
-            .expect("could not delete bridge");
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 struct Tap {
-    pub(crate) name: String,
     pub(crate) ip_addr: Ipv4Addr,
     pub(crate) mac_addr: MacAddr,
+    tap: Arc<RwLock<usertap::Tap>>,
 }
 
 impl Tap {
-    async fn create(name: String, ip_addr: Ipv4Addr) -> Self {
-        run_ip_command("tuntap", vec!["add", &name, "mode", "tap"])
-            .await
-            .expect("could not create tap device");
-
-        run_ip_command("link", vec!["set", "dev", &name, "up"])
-            .await
-            .expect("Could not start");
-
+    fn create(name: String, ip_addr: Ipv4Addr) -> Self {
         Tap {
-            name,
             ip_addr,
             mac_addr: MacAddr::from([0x0, 0x60, 0x2f, random(), random(), random()]),
+            tap: Arc::new(RwLock::new(usertap::Tap::new(&name).unwrap())),
         }
     }
 
-    async fn destroy(self) {
-        run_ip_command("tuntap", vec!["del", &self.name, "mode", "tap"])
-            .await
-            .expect("Could not delete tap device");
-    }
+    fn destroy(self) {}
 }
 
 #[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
@@ -324,8 +224,8 @@ pub(crate) struct TapUser {
 }
 
 impl TapUser {
-    pub fn device(&self) -> &str {
-        &self.tap.as_ref().unwrap().name
+    pub fn device(&self) -> String {
+        self.tap.as_ref().unwrap().tap.read().unwrap().deref().name.to_string()
     }
     pub fn mac(&self) -> &MacAddr {
         &self.tap.as_ref().unwrap().mac_addr
@@ -347,7 +247,7 @@ impl NetworkConfig {
     pub(crate) fn host_ip(&self) -> Ipv4Addr {
         self.bridges.ip_addr.hosts().next().unwrap()
     }
-    pub async fn get_tap(&self) -> TapUser {
+    pub fn get_tap(&self) -> TapUser {
         let ip = self
             .ip_allocator
             .write()
@@ -355,8 +255,8 @@ impl NetworkConfig {
             .allocate()
             .expect("Out of ips");
         let id = self.ip_allocator.read().unwrap().to_id(ip);
-        let tap = Tap::create(format!("tap{id}"), ip).await;
-        self.bridges.register_tap_device(&tap).await;
+        let tap = Tap::create(format!("tap{id}"), ip);
+        self.bridges.register_tap_device(&tap);
         TapUser {
             config: self.clone(),
             tap: Some(tap),
@@ -364,6 +264,5 @@ impl NetworkConfig {
     }
     async fn release_tap(&self, tap: Tap) {
         self.ip_allocator.write().unwrap().free(tap.ip_addr);
-        tap.destroy().await;
     }
 }

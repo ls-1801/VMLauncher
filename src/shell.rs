@@ -67,12 +67,12 @@ pub async fn run_shell_command_with_stdin(
     let mut child = Command::new(
         which::which(command).map_err(|e| ShellError::new(ShellErrorEnum::BinaryNotFound(e)))?,
     )
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
 
     child
         .stdin
@@ -112,17 +112,21 @@ pub async fn run_shell_command(command: &str, args: &Vec<&str>) -> Result<String
     run_shell_command_with_env(command, &args, vec![]).await
 }
 
-#[tracing::instrument(level = tracing::Level::DEBUG, err(level = tracing::Level::INFO))]
-pub async fn run_shell_command_with_env(command: &str, args: &Vec<&str>, envs: Vec<(&str, &str)>) -> Result<String> {
+#[tracing::instrument(level = tracing::Level::INFO, err(level = tracing::Level::INFO))]
+pub async fn run_shell_command_with_env(
+    command: &str,
+    args: &Vec<&str>,
+    envs: Vec<(&str, &str)>,
+) -> Result<String> {
     let mut child = Command::new(
         which::which(command).map_err(|e| ShellError::new(ShellErrorEnum::BinaryNotFound(e)))?,
     )
-        .args(args)
-        .envs(envs)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
+    .args(args)
+    .envs(envs)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
     let exit_status = child
         .status()
         .await
@@ -147,7 +151,7 @@ pub async fn run_shell_command_with_env(command: &str, args: &Vec<&str>, envs: V
     }
 
     let stdout = stdout_as_str(&output)?;
-    trace!(output = stdout, "done");
+    info!(output = stdout, "done");
 
     return Ok(stdout.to_string());
 }
@@ -157,12 +161,12 @@ pub async fn run_command_without_output(command: &str, args: Vec<&str>) -> Resul
     let mut child = Command::new(
         which::which(command).map_err(|e| ShellError::new(ShellErrorEnum::BinaryNotFound(e)))?,
     )
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
+    .args(args)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null())
+    .spawn()
+    .map_err(|e| ShellError::new(ShellErrorEnum::SpawnFailed(e)))?;
     let exit_status = child
         .status()
         .await

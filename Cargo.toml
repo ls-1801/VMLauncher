@@ -31,9 +31,6 @@ ouroboros = "0.18.3"
 macaddr = "1.0.1"
 rand = "0.9.0-alpha.0"
 
-# network utils require root
-sudo = "0.6.0"
-
 # util
 indoc = "2.0.4"
 strum = "0.26.1"
@@ -61,5 +58,7 @@ serde_json = "1.0.114"
 home = "0.5.9"
 caps = "0.5.5"
 libc = "0.2.153"
-nix = { version = "0.28.0", features = ["ioctl"] }
+nix = { version = "0.28.0", features = ["ioctl", "socket"] }
 users = "0.11.0"
+byteorder = "1.5.0"
+bytemuck = { version = "1.15.0", features = ["derive"]}

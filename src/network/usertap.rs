@@ -1,38 +1,32 @@
-use libc::{__c_anonymous_ifr_ifru, c_char, c_int, c_short, ifreq, memcpy};
-use nix::sys::ioctl;
+use std::ffi::{CStr, FromBytesUntilNulError};
+use std::os::fd::{AsRawFd, OwnedFd};
+
+use libc::{c_int, c_short, ifreq, IFF_TAP};
 use nix::sys::ioctl::ioctl_param_type;
-use nix::unistd::close;
-use nix::{
-    ioctl_read, ioctl_readwrite, ioctl_write_buf, ioctl_write_int, ioctl_write_ptr, NixPath,
-};
-use std::ffi::{c_void, CStr, CString, FromBytesUntilNulError};
-use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType};
 use thiserror::Error;
+use tracing::{error, info};
 use users::get_current_uid;
 
-const IFNAMSIZ: usize = 16;
-const IFF_TAP: c_short = 2;
-const IFF_TUN: c_short = 1;
-const IFF_NO_PI: c_short = 0x1000;
-const IFF_NAPI: c_short = 0x0010;
+use crate::network::common::{
+    create_ifreq, get_if_index, tun_set_iff, tun_set_owner, tun_set_persist, CommonError,
+};
 
-const TUN_IOC_MAGIC: u8 = b'T';
-const TUN_IOC_SET_IFF: u8 = 202;
-const TUN_IOC_SET_PERSIST: u8 = 203;
-const TUN_IOC_SET_OWNER: u8 = 204;
-ioctl_write_ptr!(tun_set_iff, TUN_IOC_MAGIC, TUN_IOC_SET_IFF, c_int);
-ioctl_write_int!(tun_set_persist, TUN_IOC_MAGIC, TUN_IOC_SET_PERSIST);
-ioctl_write_int!(tun_set_owner, TUN_IOC_MAGIC, TUN_IOC_SET_OWNER);
-
+#[derive(Debug)]
 pub(crate) struct Tap {
-    name: String,
-    fd: RawFd,
+    pub(crate) name: String,
 }
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        close(self.fd).expect("Could not close tap device");
+        info!("Dropping Tap: {}", self.name);
+        if let Err(e) = Self::get_tun_device(&self.name).and_then(|f| {
+            unsafe { tun_set_persist(f.as_raw_fd(), 0) }
+                .map_err(|e| UserTapError::CouldNotGetIndex(e, "Unpersisting"))?;
+            Ok(())
+        }) {
+            error!("Could not close tap device: {e:?}");
+        }
     }
 }
 
@@ -52,41 +46,48 @@ pub(crate) enum UserTapError {
     FFI(#[source] FromBytesUntilNulError),
     #[error("Could not create Tap Device. Error Code: {0}")]
     CouldNotCreateTap(nix::Error),
+    #[error("When creating Tap Device: {0}")]
+    CommonError(#[from] CommonError),
+    #[error("Could not get the tap interfaces index, {1}: {0}")]
+    CouldNotGetIndex(nix::Error, &'static str),
 }
 
 type Result<T> = core::result::Result<T, UserTapError>;
 
 impl Tap {
-    pub async fn new(name: &str) -> Result<Self> {
+    pub fn new(name: &str) -> Result<Self> {
         Self::check_caps()?;
-        let device = Self::get_tun_device().await?.into_raw_fd();
-        println!("fd: {}", device);
+        let device = OwnedFd::from(Self::get_tun_device(name)?);
+        println!("fd: {}", device.as_raw_fd());
 
-        let mut req = unsafe { MaybeUninit::<ifreq>::zeroed().assume_init() };
-        let mut name_bytes_iter = name.as_bytes().iter();
-        req.ifr_name[0..name.len()].fill_with(|| *(name_bytes_iter.next().unwrap()) as c_char);
-        req.ifr_ifru.ifru_flags = IFF_TAP;
-
-        let result = unsafe { tun_set_iff(device, &req as *const ifreq as *const c_int) }
-            .map_err(UserTapError::CouldNotCreateTap)?;
-        if result < 0 {
-            panic!("Something fishy {}", result);
-        }
-
-        let name = unsafe { CStr::from_ptr(req.ifr_name.as_ptr()) }
-            .to_str()
-            .unwrap()
-            .to_string();
         let current_user = get_current_uid();
-        unsafe { tun_set_owner(device, current_user as ioctl_param_type) }.unwrap();
+        unsafe { tun_set_owner(device.as_raw_fd(), current_user as ioctl_param_type) }.unwrap();
+        unsafe { tun_set_persist(device.as_raw_fd(), 1) }
+            .map_err(|e| UserTapError::CouldNotGetIndex(e, "Persisting"))?;
 
         Ok(Self {
             name: name.to_string(),
-            fd: device,
         })
     }
 
-    async fn get_tun_device() -> Result<std::fs::File> {
+    pub(crate) fn get_index(&self) -> Result<c_int> {
+        let mut req = create_ifreq(&self.name)?;
+        let fd = nix::sys::socket::socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(|e| UserTapError::CouldNotGetIndex(e, "Opening Socket"))?;
+
+        unsafe { get_if_index(fd.as_raw_fd(), &mut req as *mut ifreq as *mut c_int) }
+            .map_err(|e| UserTapError::CouldNotGetIndex(e, "Ioctl"))?;
+
+        let index = unsafe { req.ifr_ifru.ifru_ifindex };
+        Ok(index)
+    }
+
+    fn get_tun_device(name: &str) -> Result<std::fs::File> {
         let device_path = std::path::PathBuf::from("/dev/net/tun");
 
         if !device_path.exists() {
@@ -106,6 +107,12 @@ impl Tap {
         if metadata.permissions().readonly() {
             return Err(UserTapError::DeviceNotAccessible);
         }
+
+        let mut req = create_ifreq(name)?;
+        req.ifr_ifru.ifru_flags = IFF_TAP as c_short;
+
+        let _ = unsafe { tun_set_iff(device.as_raw_fd(), &req as *const ifreq as *const c_int) }
+            .map_err(UserTapError::CouldNotCreateTap)?;
 
         Ok(device)
     }

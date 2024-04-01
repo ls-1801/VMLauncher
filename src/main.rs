@@ -1,9 +1,11 @@
-use async_std::future::{self, timeout};
+use async_std::future::{self, timeout, TimeoutError};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
+use std::future::Future;
 use std::io::stdin;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::pin::{pin, Pin};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
@@ -17,6 +19,7 @@ use async_std::task;
 use async_std::task::JoinHandle;
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand};
+use futures::FutureExt;
 use inquire::{CustomType, InquireError};
 use ipnet::Ipv4Net;
 use itertools::Itertools;
@@ -132,7 +135,7 @@ async fn add_unikernel(
         ip: args.ip,
     };
 
-    let tap = nc.get_tap().await;
+    let tap = nc.get_tap();
     let lc = nanos::prepare_launch(
         wc,
         tap,
@@ -144,10 +147,13 @@ async fn add_unikernel(
             run_config: RunConfig {
                 gateway: nc.host_ip(),
             },
+            use_docker: false,
         },
     )
     .await
     .map_err(Error::Nanos)?;
+
+    info!("Starting Qemu");
     let handle = start_qemu(lc).await.map_err(Error::Qemu)?;
     let serial_socket = handle.serial_path();
     Ok((
@@ -236,7 +242,7 @@ async fn add_worker(
     nc: NetworkConfig,
     args: AddWorkerArgs,
 ) -> Result<(QemuProcessHandle, Result<(), Error>), Error> {
-    let tap = nc.get_tap().await;
+    let tap = nc.get_tap();
     let worker_id = args.worker_id;
 
     let sources = (0..args.number_of_sources)
@@ -299,7 +305,7 @@ fn interactive_main(args: InteractiveArgs, keep_bridge_alive: bool) -> Result<()
         })
         .unwrap();
 
-    let bridges = futures_lite::future::block_on(network_setup(gateway_ip));
+    let bridges = network_setup(gateway_ip);
     {
         let mut serials = vec![];
         let mut qemu_instances = vec![];
@@ -389,6 +395,7 @@ enum ScriptCommands {
     AddUnikernel(AddUnikernelArgs),
 }
 
+type RunResult = Result<(QemuProcessHandle, Result<(), Error>), Error>;
 fn run_commands_stop_at_first_error(
     bridges: &NetworkConfig,
     qemu_instances: &mut Vec<QemuProcessHandle>,
@@ -396,15 +403,15 @@ fn run_commands_stop_at_first_error(
     commands: Vec<ScriptCommands>,
     stop: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Error> {
-    let mut startup_tasks = vec![];
+    let mut startup_tasks: Vec<Pin<Box<dyn Future<Output = RunResult>>>> = vec![];
     for command in commands {
         match command {
             ScriptCommands::AddWorker(args) => {
-                startup_tasks.push(task::spawn(add_worker(bridges.clone(), args)));
+                startup_tasks.push(Box::pin(add_worker(bridges.clone(), args)));
                 sleep(Duration::from_secs(10));
             }
             ScriptCommands::AddUnikernel(args) => {
-                startup_tasks.push(task::spawn(add_unikernel(bridges.clone(), args)));
+                startup_tasks.push(Box::pin(add_unikernel(bridges.clone(), args)));
             }
         }
         let has_stopped = stop.as_ref().0.lock().unwrap();
@@ -414,7 +421,21 @@ fn run_commands_stop_at_first_error(
         }
     }
 
-    futures::future::join_all(startup_tasks);
+    let mut all_done = futures::future::join_all(startup_tasks).fuse();
+    let result;
+    loop {
+        let has_stopped = stop.as_ref().0.lock().unwrap();
+        if *has_stopped {
+            info!("Script interrupted");
+            return Ok(());
+        }
+        futures::select! {
+            a = all_done => {result = a; break;},
+            default => continue,
+        }
+    }
+
+    println!("{:?}", result);
 
     Ok(())
 }
@@ -438,7 +459,7 @@ fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
     })
     .expect("Error settings ctrl-c handler");
 
-    let bridges = futures_lite::future::block_on(network_setup(args.ip_range));
+    let bridges = network_setup(args.ip_range);
     {
         let mut qemu_instances = vec![];
         let mut serials = vec![];
@@ -474,9 +495,15 @@ fn script_main(args: ScriptArgs, keep_bridge_alive: bool) -> Result<(), Error> {
 }
 
 fn run_test() {
-    let tap = task::block_on(network::usertap::Tap::new("tap56")).unwrap();
-    let tap = task::block_on(network::usertap::Tap::new("tap32")).unwrap();
-    sleep(std::time::Duration::from_secs(60));
+    let bridge =
+        network::userbridge::Bridge::new("bridge2", "10.0.0.0/24".parse::<Ipv4Net>().unwrap())
+            .unwrap();
+    {
+        let tap = network::usertap::Tap::new("tap56").unwrap();
+        bridge.add_tap(&tap).unwrap();
+        sleep(std::time::Duration::from_secs(10));
+    }
+    sleep(std::time::Duration::from_secs(10));
 }
 
 fn main() {
@@ -489,7 +516,7 @@ fn main() {
         }
         VMLauncherCommand::Script(sa) => {
             script_main(sa, args.keep_bridge_alive).expect("Script Failed")
-        },
+        }
         VMLauncherCommand::Test => {
             run_test();
         }

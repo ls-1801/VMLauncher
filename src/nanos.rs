@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use tempdir::TempDir;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::fmt::format;
 use which::which;
 
@@ -27,6 +27,7 @@ pub struct Args {
     pub(crate) klib_dir: Option<String>,
     pub(crate) debugflags: Vec<String>,
     pub(crate) run_config: RunConfig,
+    pub(crate) use_docker: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +99,6 @@ pub(crate) async fn prepare_launch(
             worker_configuration.elf_binary.as_str()
         )));
     }
-
     let (binary_name, config_file) = if args.use_docker {
         let elf_binary_filename = worker_configuration.elf_binary.file_name().unwrap();
         (
@@ -147,4 +147,33 @@ pub(crate) async fn prepare_launch(
         num_cores: Some(1),
         memory_in_mega_bytes: Some(512),
     })
+}
+
+async fn ops_build_using_local(
+    ops_args: Vec<&str>,
+    config: &UnikernelWorkerConfig,
+    dest_image: &PathBuf,
+) -> Result<(), NanosError> {
+    run_shell_command("ops", &ops_args)
+        .await
+        .map_err(NanosError::Shell)?;
+
+    let source_image = homedir::get_my_home()
+        .unwrap()
+        .unwrap()
+        .join(format!(".ops/images/{}.img", config.image_name()));
+
+    async_std::fs::copy(source_image, dest_image)
+        .await
+        .map_err(|e| NanosError::FileSystem(e, "copying image"))?;
+
+    Ok(())
+}
+
+async fn ops_build_using_docker(
+    p0: Vec<&str>,
+    p1: &UnikernelWorkerConfig,
+    p2: &TempDir,
+) -> Result<(), NanosError> {
+    todo!()
 }
